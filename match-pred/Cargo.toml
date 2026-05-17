@@ -1,0 +1,14 @@
+[package]
+name = "percolator-match-pred"
+version = "0.0.1"
+description = "LMSR matcher binary for Percolator prediction markets"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["lib"]
+
+[lints]
+workspace = true

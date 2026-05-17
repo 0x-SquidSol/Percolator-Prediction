@@ -1,0 +1,14 @@
+/target
+/**/target
+Cargo.lock.bak
+*.swp
+.idea/
+.vscode/
+.DS_Store
+
+# Node / TS scaffolding lands later; pre-emptive ignore so build artifacts
+# from those tooling chains don't drift into the repo.
+node_modules/
+dist/
+.next/
+.turbo/
