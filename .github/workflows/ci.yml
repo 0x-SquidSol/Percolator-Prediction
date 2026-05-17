@@ -38,3 +38,26 @@ jobs:
 
       - name: cargo clippy --workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  js-checks:
+    name: TypeScript (typecheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm -r run typecheck
+        run: pnpm -r run typecheck
