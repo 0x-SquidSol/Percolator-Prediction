@@ -1,0 +1,38 @@
+{
+  "name": "@percolatorct/sdk-pred",
+  "version": "0.0.1",
+  "description": "Staging SDK additions for Percolator prediction markets (merges into @percolatorct/sdk 3.0 at launch)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/0x-SquidSol/Percolator-Prediction.git",
+    "directory": "sdk-pred"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "clean": "rimraf dist"
+  },
+  "devDependencies": {
+    "rimraf": "^5.0.5",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "private": true
+}
