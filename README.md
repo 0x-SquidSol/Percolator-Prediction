@@ -363,6 +363,14 @@ The split between this standalone repo and the feature-branch-on-upstream approa
 
 **Phase 1+ (post-kickoff):** standard PR workflow against this repo for the components listed in [Repo layout](#repo-layout-planned). Feature work on upstream `dcccrypto` repos for wrapper/engine/frontend changes.
 
+Local setup, required CI checks, commit-message style, and PR review expectations are documented in [CONTRIBUTING.md](./CONTRIBUTING.md).
+
+---
+
+## Security
+
+Pre-launch design code under active development; do not deploy any artifact built from this repository to a production Solana cluster. Vulnerability reports go through the channel documented in [SECURITY.md](./SECURITY.md).
+
 ---
 
 ## Full proposal
@@ -375,4 +383,4 @@ The complete integration spec — 14 sections, ~12,000 words, with on-chain fiel
 
 ## License
 
-To be aligned with the upstream Percolator protocol license at implementation kickoff.
+Apache License 2.0 — see [LICENSE](./LICENSE). Matches the rest of the Percolator project (`dcccrypto/percolator`, `dcccrypto/percolator-launch`, `dcccrypto/percolator-stake`, all Apache-2.0).
