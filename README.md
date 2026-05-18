@@ -137,7 +137,7 @@ One click → wallet signature → funds in. The same notification fires via ema
 
 **Prediction markets on Percolator are mostly a configuration variant of the existing perp engine, not a new program.**
 
-After auditing the production `percolator-prog` wrapper end-to-end, the design pod confirmed that Percolator's existing `ResolveMarket`, `ResolvePermissionless`, and `ForceCloseResolved` instructions already implement most of the settlement state machine. We don't need to fork the engine; we just need to bind a resolution oracle and constrain the settlement price.
+After auditing the production `percolator-prog` wrapper end-to-end, engineering verification confirmed that Percolator's existing `ResolveMarket`, `ResolvePermissionless`, and `ForceCloseResolved` instructions already implement most of the settlement state machine. We don't need to fork the engine; we just need to bind a resolution oracle and constrain the settlement price.
 
 Concretely: ~80% of the work reuses what already exists. ~20% is new.
 

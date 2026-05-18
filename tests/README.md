@@ -16,7 +16,7 @@ End-to-end devnet-targeted scripts that exercise full prediction-market lifecycl
 
 ## Running
 
-(Pending: CI workflow + dependency install. See the lead-review deferral note in PREDICTION-MARKETS-ROADMAP.md.)
+(Pending: scenario implementations. The package is set up and typechecks today; scripts land in subsequent commits.)
 
 Once deps are installed:
 
