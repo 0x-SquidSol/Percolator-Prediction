@@ -21,8 +21,8 @@ End-to-end devnet-targeted scripts that exercise full prediction-market lifecycl
 Once deps are installed:
 
 ```
-npm run typecheck
-npm test
+pnpm typecheck
+pnpm test
 ```
 
 ## Requirements when tests are real
