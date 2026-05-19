@@ -193,13 +193,24 @@ Instruction::ResolvePredictionMarket { outcome } => {
 
 ### 2.6 Invalid/refund mode
 
-`outcome == 3` is the catch-all for malformed markets ("criteria meaningless"). We add **one new engine method**, `resolve_market_refund_not_atomic` (~60 lines, sits next to `resolve_market_not_atomic`):
-- Sets `engine.market_mode = Resolved`.
-- Zeroes every account's PnL.
-- Leaves `account.collateral` untouched.
-- Existing `ForceCloseResolved` then withdraws each user's collateral as-is.
+`outcome == 3` is the catch-all for markets that cannot resolve YES or NO — the underlying event was cancelled, the resolution criteria became impossible to evaluate, or the resolver explicitly elects the refund branch.
 
-Trading fees are NOT refunded — they were earned by LPs.
+We add **one new engine method**, `resolve_market_refund_not_atomic`, that transitions the market from `Live` to `Resolved` while leaving every trader whole on their **open positions**. The mechanism, in plain language:
+
+- For any account with an **open position** at refund time: the position is detached at zero unrealized PnL (the "close at entry price" semantic). The position's contribution to the market's aggregate open-interest and stored-position-count is removed; the trader's `capital` is preserved.
+- For any account **without** an open position at refund time: the engine does nothing. Already-closed trades stay closed — a trader who took a profit (or loss) on an earlier trade and then closed before resolution keeps that realized result. This matches the convention used by Polymarket and Kalshi for INVALID resolution.
+- `engine.market_mode` transitions to `Resolved`, with the same `resolved_slot` / `current_slot` / `last_market_slot` bookkeeping as the normal resolve path. The `resolved_payout_*` snapshot fields are zero sentinels since refund mode has no terminal payout to distribute.
+- After resolution, the existing `force_close_resolved_not_atomic` path lets each user withdraw their preserved `capital` (plus any `reserved_pnl` / warmup reserves that terminal-close consolidates in the existing flow).
+
+Trading fees are NOT refunded — they were earned by LPs and the protocol during the market's life.
+
+Two engine-level invariants shape the scope:
+
+1. **`oi_eff_long_q == 0 && oi_eff_short_q == 0` at resolve exit** — enforced by `assert_public_postconditions_fast`. Refund mode meets this by detaching every open position before the mode transition, NOT by deferring per-account work to `force_close_resolved_not_atomic`.
+
+2. **`sched_remaining + pending_remaining == reserved_pnl` per account** — the engine's reserve-shape invariant links warmup reserves and reserved positive PnL one-to-one. They are not separately drainable into `capital`. Refund mode therefore does NOT touch `reserved_pnl` or warmup reserves; terminal close handles them through the existing per-account consolidation.
+
+**Sizing note:** the engine method is implemented as a private per-account helper (`refund_detach_account`) plus the public `resolve_market_refund_not_atomic` that iterates active accounts and finalizes the side reset. Combined with the matching Kani proofs in `tests/proofs_prediction.rs`, total surface is closer to 300–500 lines across the engine crate. Still a small new surface relative to the rest of the engine, and well within the audit budget described in Section 11.
 
 ### 2.7 Insurance fund coverage
 
@@ -615,7 +626,7 @@ The existing `TradeCpi`-based wallet code doesn't need to know about prediction 
 | `ClaimBond` (tag 38, V2) | | | ✓ |
 | Insurance fund (`percolator-stake`) | ✓ | | |
 | Engine `resolve_market_not_atomic` | ✓ (called with `funding_rate = 0`) | | |
-| Engine `resolve_market_refund_not_atomic` | | | ✓ (~60 lines, for INVALID) |
+| Engine `resolve_market_refund_not_atomic` + per-account helper | | | ✓ (for INVALID; see §2.6 for the helper-plus-iterator shape and the sizing note) |
 | Engine `force_close_resolved_with_fee_not_atomic` | ✓ | | |
 | Risk engine funding loop | ✓ (no-op when `funding_k_bps = 0`) | | |
 | Risk engine liquidation | ✓ (different margin params) | | |
@@ -794,7 +805,7 @@ Publish a public `/predictions/readiness` dashboard tracking each metric. Holds 
 | Workstream | Effort | Notes |
 |---|---|---|
 | `percolator-prog` wrapper: `ResolvePredictionMarket` + V13 layout + band carve-out | 2-3 weeks senior eng | Includes Kani proof updates |
-| `percolator` engine: `resolve_market_refund_not_atomic` (~60 lines) | 1 week | Plus test coverage |
+| `percolator` engine: `resolve_market_refund_not_atomic` + per-account detach helper | 2-3 weeks senior eng | ~300–500 lines including the Kani harness in `tests/proofs_prediction.rs`; see §2.6 for the design split |
 | `percolator-match-pred` LMSR binary | 3-4 weeks senior eng | Fixed-point log/exp + Remez approximations are the hard part |
 | `percolator-keeper`: `predictionResolution` + `predictionSettle` services | 2 weeks | TS, mostly straightforward |
 | `percolator-indexer`: `PredictionIndexer` + migrations | 1 week | TS + Supabase migration |
