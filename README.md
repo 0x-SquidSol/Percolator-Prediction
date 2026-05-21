@@ -285,6 +285,25 @@ Tracked publicly at a future `/predictions/readiness` dashboard so the community
 
 **V2 effort:** ~6-8 additional weeks (the long pole is the UMA Solana-side adapter; can be built in parallel with V1 mainnet runway).
 
+### V3 — leveraged probability perps
+
+A follow-on product extension specified in [Section 15 of the proposal](./PREDICTION-MARKETS-PROPOSAL.md): perpetual futures whose oracle is a prediction market's time-weighted implied probability. Traders get **up to 5x leverage** on probability movements — they can long or short the *path* the probability takes between launch and resolution, not just the binary `{0, 1}` outcome.
+
+Concrete example: "Will Trump win 2028?" is trading at implied 0.42. A trader who thinks news flow will push it to 0.60 opens a 3x perp long. If the probability moves 0.42 → 0.50, they make roughly (0.08 / 0.42) × 3 ≈ 57% on margin. They can close anytime; they get liquidated if the probability moves the other way past their margin buffer; or they hold to resolution where the underlying snaps to 0 or 1.
+
+**Why this fits cleanly:**
+
+- **No new program, no new matcher binary, no new engine method.** Another `market_kind` variant (`market_kind = 2`) on top of the V1/V2 work. Reuses the existing oracle-anchored spread quoter, `KeeperCrank`, `LiquidationPolicy`, ADL machinery, and insurance fund.
+- **Bounded-domain math.** Worst-case loss per unit is computable in closed form (`p₀` for longs, `1 − p₀` for shorts). Insurance fund sizing has a clean formula: `~0.5 × LP_collateral` at perp launch.
+- **5x leverage cap is a product-safety decision, not a technical limit.** Industry-standard 1.54:1 IM/MM ratio. Effective leverage is engine-enforced down to 2x when entry probability is outside `[0.20, 0.80]`, and new opens are rejected outside `[0.10, 0.90]`.
+- **INVALID inheritance.** When the underlying refunds (V1/V2 INVALID path), the perp inherits INVALID and uses the same `resolve_market_refund_not_atomic` engine method.
+
+**Effort:** ~1,070 lines net new code, **~7-8 weeks total** (4-5 weeks senior eng + 2 weeks frontend + 1 week audit overlap). Dramatically cheaper than V1 because the matcher binary and engine method already exist from V1.
+
+**Greenlight criteria:** V1 + V2 prediction markets must run for **≥60 days in production** with no resolution-pipeline P0/P1 incidents before V3 work begins. This is what we build *after* prediction-spot proves itself.
+
+Full design — oracle adapter, lifecycle integration, margin math, liquidation cascade, insurance sizing, full UX spec including the ASCII trade-page mockup — is in [Section 15 of the proposal](./PREDICTION-MARKETS-PROPOSAL.md#section-15--leveraged-probability-perps-v3-product-extension).
+
 ---
 
 ## Repo layout (planned)
