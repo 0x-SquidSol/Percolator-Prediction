@@ -816,7 +816,247 @@ Publish a public `/predictions/readiness` dashboard tracking each metric. Holds 
 | Third-party audit | 4 weeks | Single senior auditor; can overlap final 2 weeks of build |
 | Devnet trial period | 2 weeks | Hard gate before mainnet |
 
-**Total: ~16-18 weeks (4 months) from kickoff to V1 mainnet launch**, assuming 2 senior engineers + 1 frontend engineer + 1 PM + audit in parallel. **V2 permissionless adds ~6-8 weeks** for `InitPredictionMarket`, `DisputeResolution`, `ClaimBond` + UMA Solana-side adapter (the latter is the long pole).
+**Total: ~16-18 weeks (4 months) from kickoff to V1 mainnet launch**, assuming 2 senior engineers + 1 frontend engineer + 1 PM + audit in parallel. **V2 permissionless adds ~6-8 weeks** for `InitPredictionMarket`, `DisputeResolution`, `ClaimBond` + UMA Solana-side adapter (the latter is the long pole). A follow-on **V3 product extension** — leveraged perps on prediction-market implied probabilities — is specified in Section 15 below as a separate, smaller workstream that does not block V1 or V2.
+
+---
+
+## Section 15 — Leveraged Probability Perps (V3 product extension)
+
+### 15.1 Premise
+
+A binary prediction market's `last_p_yes_e6` is an on-chain time series of implied probability between launch and `resolution_open_unix`. Traders want leveraged exposure to *the path that probability takes* — debate gaffes, polling shocks, news cycles, last-minute goals — not just the terminal `{0, 1}` payoff. A perpetual future whose oracle equals the time-weighted underlying mid is the cleanest expression of that demand.
+
+Hard product cap: **5x leverage.** Non-negotiable, set by lead developer. Rationale: a single 20% probability move (on-distribution for real prediction markets) wipes a 5x position; higher leverage adds tail-risk without product value, and the bounded-domain math (§15.5) means worst-case loss is fixed in closed form rather than stochastic.
+
+Greenlight contingent on V1/V2 prediction-market launch holding for ≥60 days with no resolution-pipeline P0/P1 incidents. This section is what we build *after* prediction-spot proves itself in production.
+
+### 15.2 Architecture fit — another `market_kind` variant
+
+This is **`market_kind = 2` (`PerpOnPrediction`)**, NOT a new program, NOT a new matcher binary, NOT a new engine method. The V13 `MarketConfig` tail (§2.2) already discriminates kinds; we extend the enum, no layout bump:
+
+```rust
+//  0 = Perp (legacy), 1 = PredictionBinary, 2 = PerpOnPrediction (V3)
+pub market_kind: u8,
+```
+
+What we reuse, unchanged:
+
+- **Matcher binary:** existing `percolator-match` (oracle-anchored spread quoter, `exec = oracle × (1 ± total_bps/10_000)`). Its design is exactly what we want — the oracle just happens to be a probability instead of a SOL/USD mid.
+- **`TradeCpi` (tag 10)** — same hot path. The `market_kind != 0` band-floor carve-out from §2.4 already widens to 200 bps, which is correct for this product too.
+- **`KeeperCrank` (tag 5)**, `LiquidationPolicy::FullClose`, ADL via `adl_mult_long` / `adl_mult_short`, insurance fund — untouched.
+- **Funding-rate machinery — set to zero, hard-coded**, mirroring §4.1. The perp's matcher quotes off the oracle, so by construction there is no matcher-vs-oracle drift to bleed off. Funding would be a pure leverage tax paid to no useful end. `funding_k_bps = 0`, engine path becomes a no-op.
+
+### 15.3 Oracle adapter — pull, not push
+
+This is the load-bearing new piece. Two options were considered:
+
+**(a) Push-based.** A keeper TWAPs the underlying off-chain and writes into a `hyperp_authority`-style account every N slots.
+**(b) Pull-based.** A new branch in `read_price_and_stamp` reads `BinaryLmsrState.last_p_yes_e6` directly from the underlying slab's matcher-context tail, then time-weights it against a slot-indexed ring buffer stored in the perp's own `MarketConfig` tail.
+
+**Pick (b).** Push adds a trusted keeper to the critical path — an attack surface this protocol has explicitly hardened against in prior security work. Pull keeps the perp's oracle as a deterministic function of on-chain state the user can verify in the same transaction.
+
+Adapter spec (~150 lines in `percolator-prog/src/percolator.rs` alongside `read_price_and_stamp`):
+
+```rust
+fn read_underlying_p_yes_twap_e6(
+    perp_slab: &AccountInfo,        // market_kind == 2
+    underlying_slab: &AccountInfo,  // market_kind == 1, pinned via LinkUnderlying
+    clock: &Clock,
+) -> Result<u64, ProgramError> {
+    // 1. Verify underlying.slab_pubkey matches perp.config.underlying_slab.
+    // 2. Read underlying BinaryLmsrState.last_p_yes_e6 (matcher tail, §3.3).
+    // 3. Append (slot, p_yes_e6) to perp's 150-slot ring buffer (~60s @ 400ms/slot).
+    // 4. Reject if underlying.config.b_e6 < MIN_UNDERLYING_DEPTH_E6 (5_000 USDC).
+    // 5. Reject if underlying state is LOCKED/RESOLVING/RESOLVED — handled by lifecycle (§15.4).
+    // 6. Reject if last write to ring is > STALENESS_WINDOW_SLOTS (30) ago.
+    // 7. Return TWAP, clamped to [10_000, 990_000] e6 (= [1%, 99%]).
+}
+```
+
+Concrete oracle parameters:
+
+| Knob | Value | Rationale |
+|---|---|---|
+| TWAP window | **150 slots (~60s @ 400ms)** | underlying mids move slowly by design; resists single-block manipulation; matches mainstream perp-oracle best practice |
+| Clamp range | **`[10_000, 990_000]` e6** | leverage math diverges below 1% / above 99%; clamp instead of halt |
+| Min underlying depth | **`b_e6 ≥ 5_000_000_000` (5k USDC)** | thin LMSR is cheap to push; reject perp creation otherwise |
+| Staleness window | **30 slots (~12s)** | no underlying trade in 30 slots → `OraclePaused`, halts perp matching |
+| Entry-deviation guard | **`|p₀ − TWAP| / TWAP ≤ 100 bps`** | stale-oracle snipes get rejected at the wrapper |
+| Per-slot move clip | **`max_price_move_bps_per_slot = 2_000`** | tighter than §4.2 spot value (5,000) because the oracle is already TWAP-smoothed |
+
+### 15.4 Lifecycle — the perp inherits the underlying's state machine
+
+The underlying transitions `LIVE → LOCKED → RESOLVING → RESOLVED` (§6.5). The perp tracks:
+
+| Underlying state | Perp behavior |
+|---|---|
+| `LIVE` | Normal trading. Oracle = 150-slot TWAP of underlying `p_yes_e6`. |
+| `LOCKED` (last 60 min before underlying resolution) | Perp halts new positions; close-only. Banner mirrors underlying countdown. Configurable per-market via `perp_locks_with_underlying: bool` (default `true`). |
+| **Pre-resolution perp-only halt** | Perp trading closes **4 hours** before underlying's `resolution_open_unix` — *wider* than the underlying's 60-min lock because perp positions are leveraged and terminal-snap is binary. |
+| `RESOLVING` | **Terminal-snap force-close.** Keeper calls `ForceCloseResolved` (tag 30) with `resolved_price = underlying.config.resolution_outcome → {1, 1_000_000}` per §2.5. Every open perp position settles at the terminal probability. |
+| `RESOLVED` with `outcome = 3` (INVALID) | **Perp inherits INVALID.** Calls `resolve_market_refund_not_atomic` (the engine method from §2.6). Open positions detached at zero unrealized PnL, collateral preserved. Trading fees stay with LPs and the protocol. |
+
+The lifecycle hook lives in **`predictionSettle.ts`** (§8.1): on observing a `ResolvePredictionMarket` event for slab X, the keeper looks up all `market_kind = 2` slabs with `config.underlying_slab == X` and queues `ForceCloseResolved` for each.
+
+### 15.5 Margin parameters & the bounded-domain insight
+
+Standard perps oracle off an unbounded price. A probability perp oracles off `p ∈ [10_000, 990_000]` e6. Three consequences shape every parameter below.
+
+1. **Worst-case loss per unit is closed-form, not stochastic.** A long opened at entry `p₀` loses at most `p₀` per unit notional (mark → 0). A short opened at `p₀` loses at most `1 − p₀` per unit. The engine integrates max loss exactly across the OI book without statistical tail estimation.
+2. **Margin should be asymmetric near the bounds.** A long at `p = 0.95` has upside 0.05 and downside 0.95 — symmetric `initial_margin_bps` over-funds upside and under-funds downside. We solve this with a leverage-cap shaping function (banded clamp), not a notional tweak, because shaping leverage preserves the existing `initial_margin_bps` field semantics.
+3. **Per-unit-time volatility is bounded.** `p` cannot legitimately move more than 1.0 over the market's entire life. Funding math that assumes log-returns is meaningless; we hard-zero funding (§15.2).
+
+Base margin params:
+
+| Param | Coin-margined SOL perp | `PerpOnPrediction` |
+|---|---:|---:|
+| `initial_margin_bps` | 500 (20x) | **2_000 (5x)** |
+| `maintenance_margin_bps` | 250 | **1_300** |
+| `max_price_move_bps_per_slot` | 500 | **2_000** |
+| `max_active_positions_per_side` | matcher LP `b` × 100% | underlying `b` × 20% |
+
+The MM ratio (1_300 / 2_000 = 65%) holds the industry-standard ~1.5:1 (Drift, dYdX, Hyperliquid all in this band). Tighter leaves no liquidation buffer; looser wastes margin headroom on a bounded domain.
+
+**Asymmetric overlay — engine-enforced, not UI-restricted.** The UI exposes the 5x slider unconditionally; the engine recomputes the cap from `p₀` at trade time and rejects if the requested leverage exceeds it:
+
+```
+denom = max(p₀, 1 − p₀)
+if denom ≤ 0.80:    cap = 5x          # full 5x in [0.20, 0.80]
+elif denom ≤ 0.90:  cap = 2x          # soft asymmetry zone
+else:               reject_open       # outside [0.10, 0.90], no new opens
+```
+
+Closes are always permitted regardless of `p`. Effective `initial_margin_bps` is `10_000 / cap`, so the 2x band requires 5_000 bps IM and the engine raises `MarginShortfall` if the wallet doesn't post.
+
+### 15.6 Liquidation trigger
+
+Notional must be defined against the domain — not against an unbounded price. We use **side-conditional notional**:
+
+```
+notional_long(p)  = position_size × p           # max loss per unit = p
+notional_short(p) = position_size × (1 − p)     # max loss per unit = 1 − p
+```
+
+Liquidation inequality (per side):
+
+```
+equity < (maintenance_margin_bps / 10_000) × notional_side(p_mark)
+```
+
+Two clean properties fall out: (a) liquidation price for a long collapses smoothly to 0 (not asymptotically infinite), and (b) maintenance requirement automatically shrinks as the position moves into the money, releasing margin without an explicit reduce-only path.
+
+**Cascade flow — perp slab only.** A 0.40 → 0.20 underlying move triggers:
+
+1. Oracle adapter updates the perp's `mark_ewma_e6`; `KeeperCrank` sweeps and flags underwater accounts via the existing `LiquidationPolicy::FullClose` path.
+2. Keeper closes liquidated positions against the **perp's own orderbook** (its spread quoter widens against the move per the standard impact term). No CPI into the prediction matcher.
+3. If perp-side losses exceed LP collateral, engine routes to `engine.insurance_fund.balance` — same path as §2.7.
+4. If insurance hits zero, ADL fires via existing `adl_mult_long` / `adl_mult_short`, socializing loss across winning counterparties proportional to unrealized PnL.
+
+The cascade is contained to the perp slab. The underlying market keeps quoting — its LMSR LPs are not exposed to perp-side insolvency, only to their own `b × ln(2)` bound from §3.2.
+
+### 15.7 Insurance fund sizing
+
+Bounded-domain math collapses the seed formula to closed form. Maximum aggregate loss across the book:
+
+```
+max_aggregate_loss = Σ_longs  (entry_pᵢ × sizeᵢ)
+                   + Σ_shorts ((1 − entry_pᵢ) × sizeᵢ)
+```
+
+With 5x leverage cap, max OI per side ≤ `5 × LP_collateral`. Worst-case `max(entry_p, 1 − entry_p) ≤ 0.90` (entries outside `[0.10, 0.90]` are rejected per §15.5). Seed at:
+
+```
+insurance_seed = 0.10 × 5 × LP_collateral × 0.90 ≈ 0.45 × LP_collateral
+```
+
+Round to **`0.50 × LP_collateral`** at perp launch. This is independent of the underlying prediction market's `b × ln(2)` LP-loss bound (§4.5) — the perp slab carries its own insurance tranche so a perp-side cascade cannot drain prediction-spot LPs.
+
+### 15.8 User experience
+
+**IA: a third tab, not a new top-level surface.** The leveraged-perp UI lives at `/predict/[slab]/perp`. The market-detail page (`/predict/[slab]`) gets a third tab next to `Buy YES / Buy NO / LP`: **`Leveraged 5x`**.
+
+This is correct because the trader's hardest decision is not "which market" — it is "is this a binary bet, or a chart trade?" Forcing that decision onto a single page lets users walk down the conviction gradient without re-routing: spot YES is a 1x bet on the *outcome*; perp YES (1x–5x) is a bet on the *path*. The two share the same resolution-criteria panel, the same hero card, the same `p_yes_e6` feed.
+
+Trade-page layout:
+
+```
++--------------------------------------------------------------+
+| HERO (reused): "Will Trump win 2028?" · resolves 2028-11-08  |
+| Buy YES  |  Buy NO  |  LP  | [Leveraged 5x] <-- active       |
++--------------------------------------------------------------+
+|                                              | LONG | SHORT  |
+|   p_yes chart (last 30d, candles)            +---------------+
+|   0.42 ----+                                 | Lev: 1 2 3 5  |
+|            |                                 |       ^ def 2 |
+|   --- liq 0.31 (red dashed) -----------------| Size: $___    |
+|                                              | Mark: 0.420   |
+|                                              | Liq:  0.310   |
+|                                              | Max loss: $50 |
+|                                              | Funding: 0.00%|
+|                                              +---------------+
+|                                              | If you hold   |
+|                                              | to resolution:|
+|                                              | YES -> $238   |
+|                                              | NO  -> $0     |
+|                                              +---------------+
+|                                              | [ Open Long ] |
++--------------------------------------------------------------+
+| Resolution criteria (reused from spot tab, collapsed)        |
++--------------------------------------------------------------+
+```
+
+The chart of `p_yes_e6` is the killer feature — for the first time on the platform, **opinion itself is a candle**. The liquidation line draws on the same axis as price; no separate widget. The "If you hold to resolution" panel is non-negotiable: it is the only place the binary snap to 0 or 1 is made concrete in numbers, not prose. On mobile, the right rail becomes a bottom sheet (same pattern as the spot prediction ticket).
+
+**Leverage control.** Discrete chips `1x | 2x | 3x | 5x`. No 4x — the payoff curve does not reward granularity in the middle, and bigger chips read better on mobile. No slider, no numeric input, no "advanced" toggle, no unlock path. 5x is the ceiling, baked into the UI, enforced in the order builder, and re-enforced in the engine. Default **2x**, matching the existing spot prediction cap to create a discoverability gradient. When `p_yes_e6 < 0.10` or `> 0.90`, the chip group gets a red border and a one-line warning: *"Near a bound. Small moves liquidate fast."* We educate at the moment of choice — never hide the option.
+
+**First-trade disclosure.** A blocking modal on the first perp trade for any wallet:
+
+> **You're trading the chart, not the outcome.**
+> - This is a **leveraged** position (up to 5x).
+> - You can be **liquidated** before the market resolves and lose your margin.
+> - If you hold to resolution, the price **snaps to $0 or $1** against your entry.
+>
+> [ ] I understand   `[Continue]`
+
+Checkbox required to enable `Continue`. Dismiss is one-time per wallet — never re-shown. This is the highest-risk error mode on the product (confusing perp with spot) and gets the only blocking modal in the whole flow.
+
+**Liquidation UX.** Sticky in-app banner on `/portfolio`: *"Your 3x long on '<market>' was liquidated at p = 0.31 (entry 0.42). Liquidation fee: $4.20. [View tx]"*. Email + Discord webhook fire only if user opted in (same toggle as spot). Position panel shows the row in red with a `[Postmortem]` link to a per-position page rendering the `p_yes_e6` chart with the liquidation slot marked, accrued funding, and a link to the underlying market's resolution log.
+
+**Terminal settlement UX.** One hour before underlying's `resolution_open_unix`, perp trading halts new positions (per the 4h-window in §15.4, with a 1h "trading halts soon" banner). At resolution, position snaps to 0 or 1 against entry; the position panel collapses to a single `Claim $X` button — **the exact same component as the spot-prediction claim flow.** Same color, same font, same one-tx path through `ForceCloseResolved`. A trader holding both spot YES and 3x perp YES on the same market sees two identical `Claim` buttons stacked. Deliberate — terminal UX is the moment to collapse the product distinction.
+
+**Visual differentiator.** Spot prediction is teal/blue (calm, deliberation). The perp tab borrows the existing perp red/green trading palette for the chart, ticket, and CTAs, but the prediction hero card stays on top unchanged. A user landing on `/predict/[slab]/perp` should read it as *the leveraged version of the same product*, not a separate product.
+
+### 15.9 New code surfaces
+
+| Surface | Path | Lines | Notes |
+|---|---|---:|---|
+| `market_kind = 2` constant + carve-out in `TradeCpi` | `percolator-prog/src/percolator.rs:7518-7540` | ~30 | Same band floor as `market_kind = 1` |
+| Oracle adapter (`read_underlying_p_yes_twap_e6`) | `percolator-prog/src/percolator.rs` (new) | ~150 | Ring buffer + clamp + depth + staleness checks |
+| `LinkUnderlying` instruction (tag **39**) | `percolator-prog/src/percolator.rs` | ~80 | Binds `config.underlying_slab` once at perp init; admin-only in V3, permissionless in V3.1 with bond |
+| `MarketConfig` tail extension (no V-bump) | `MarketConfig` (§2.2) | ~40 | `underlying_slab: [u8; 32]`, `perp_locks_with_underlying: bool`, 150-slot TWAP ring |
+| Lifecycle hook | `percolator-keeper/src/services/predictionSettle.ts` | ~120 | Fan-out from underlying resolution to dependent perps |
+| Engine | — | **0** | 5x cap is just margin params; refund path already exists from §2.6 |
+| Frontend perp panel | `app/components/predict/PerpOnPredPanel.tsx` | ~350 | Leverage chips capped at 5x, underlying-chart embed, liq-distance indicator |
+| Frontend hook | `app/hooks/usePerpOnPrediction.ts` | ~120 | Wraps `useVAMM` + `usePredictionMarket(underlying)` |
+| SDK | `@percolatorct/sdk` 3.1 | ~80 | `instructions.linkUnderlying`, `parseMarketConfigV13_K2` |
+| Indexer | `PerpOnPredIndexer.ts` | ~100 | New table tracking perp ↔ underlying linkage |
+
+**Total: ~1,070 lines net new.** Estimate: **4-5 weeks senior eng + 2 weeks frontend + 1 week audit overlap.** Compare to the V1 build (~1,300 lines, 16-18 weeks): V3 is dramatically cheaper because it is *purely* a configuration variant; the matcher binary and engine method work from V1 do the heavy lifting.
+
+### 15.10 Risks specific to this product
+
+| Risk | Mitigation |
+|---|---|
+| Underlying thin liquidity → oracle manipulation | Min `b_e6 ≥ 5k USDC` at `LinkUnderlying` time, 150-slot TWAP, circuit breaker on >20% TWAP delta in 10 slots auto-halts perp trading |
+| Terminal-snap creates instant winners/losers at resolution | Pre-resolution halt window: perp trading closes 4h before underlying's `resolution_open_unix` (§15.4) — wider than underlying's 60-min lock because perp positions are leveraged |
+| INVALID cascade (underlying refunds → perp must refund) | `resolve_market_refund_not_atomic` (§2.6) called via lifecycle hook. The refund-detach helper handles trade-fee retention; no new engine code |
+| User confuses perp with spot (highest-impact error) | First-trade blocking modal with required checkbox (§15.8); chip-based leverage selector that defaults to 2x; identical terminal-claim UX so the products collapse at settlement |
+| Self-referential funding spiral | N/A — funding hard-coded to zero (§15.2) |
+| Underlying matcher fee gaming via perp positioning | Out of scope for V3; flag for V3.1 monitoring with cross-market position limits if it materializes |
+
+### 15.11 Out of scope for V3
+
+Multi-outcome underlyings (perps on `market_kind = ?` when we ship `PredictionMulti`), cross-product netting between underlying spot and perp positions, SOL-denominated probability perps, and dynamic leverage tiers (e.g., 3x default with a wallet-history-gated 5x unlock). All revisit-able once V3 ships a clean lifecycle on a binary underlying.
 
 ---
 
