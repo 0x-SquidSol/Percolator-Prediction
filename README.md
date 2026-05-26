@@ -50,9 +50,9 @@ If the trader buys 100 YES shares at $0.62:
 
 **3. Liquidity providers (LPs) make the market.** LPs deposit USDC; the system uses it to quote both YES and NO prices on an automated market-maker curve. LPs earn a share of trading fees. Their capital is **locked until resolution** — they cannot bail out mid-flight.
 
-**4. The event happens.** Dec 31, 2026 arrives. The resolution authority (a 3-of-5 multisig in V1; a designated resolver of the creator's choice in V2) signs a transaction: `outcome = YES` or `outcome = NO`.
+**4. The event happens.** Dec 31, 2026 arrives. The resolution authority (a 3-of-5 multisig in V1; a designated resolver of the creator's choice in V2) signs a transaction with one of three outcomes: `YES`, `NO`, or `INVALID` (the event could not be adjudicated — for example a sports match was cancelled, or the criteria turned out to be ambiguous in a way nobody anticipated).
 
-**5. A 48-hour dispute window opens.** If a user with an open position thinks the resolution was wrong, they post a 0.5 SOL bond and challenge it. A council reviews; the original outcome is either confirmed or overturned. Bond is forfeited if the challenge fails; refunded plus a small reward if it succeeds.
+**5. A dispute window opens.** For YES/NO resolutions: 48 hours, 0.5 SOL bond to challenge. For INVALID resolutions: 48 hours of *mandatory* auto-ratification with **zero-bond disputes** — INVALID is the resolver's escape hatch and has to be the hardest path, not the easiest. Anyone holding a non-zero position can dispute for free. A council reviews; the original outcome is confirmed or overturned. Bond is forfeited if a YES/NO challenge fails; refunded plus a small reward if it succeeds.
 
 **6. Everyone claims.** After the dispute window closes, winners click "Claim" — payouts flow from the LP pool to their wallets. Losers' positions are worth $0.
 
@@ -190,10 +190,11 @@ V2 markets require the creator to deposit 5 SOL at launch into a program-owned `
 
 | Scenario | Bond outcome |
 |---|---|
-| Clean resolution, no dispute | Full refund 7 days after resolution |
+| Clean YES/NO resolution, no dispute | Full refund 7 days after resolution |
+| INVALID resolution (outcome=3), ratification window expires without upheld dispute | **20% slash to insurance, 80% returned after 7d** — prices the refund branch above zero so creators cannot use it as a free escape, while leaving room for honest "this genuinely cannot be adjudicated" calls |
 | Disputed resolution upheld by Council | 50% slash to insurance fund, 50% to disputers as reward |
 | Missed resolution SLA (96h after deadline) | 50% slash to insurance, 50% returned |
-| Market declared INVALID (criteria meaningless) | 100% slash to insurance |
+| Market declared INVALID, criteria judged meaningless or abusive by Council | 100% slash to insurance |
 | Market never traded by resolution timestamp | Full refund |
 
 5 SOL (~$1000) is the right friction floor: enough to deter trivial spam, not enough to lock out serious indie creators. Polymarket's centralized whitelist makes their friction zero; Augur's was too cheap; Kalshi's CFTC sponsorship is too expensive.
@@ -210,7 +211,9 @@ At market launch, the slab's `resolution_oracle` field is set to a Squads 2-of-3
 
 **Why a multisig and not a single key:** the resolver can drain LPs if compromised. A single signer = single point of failure. The team-internal threat model also benefits from "no single person can resolve a market on their own."
 
-**Audit trail:** every resolution is publicly indexed at `/predictions/resolutions` — market URL, claimed outcome, signers, evidence link, transaction hash. Every overturned resolution is retained permanently as a stat against the original resolver. **Three overturns within 90 days triggers admin rotation per operational policy.**
+**Audit trail:** every resolution is publicly indexed at `/predictions/resolutions` — market URL, claimed outcome, signers, evidence link, transaction hash. Every overturned resolution is retained permanently as a stat against the original resolver.
+
+**Resolver auto-rotation triggers.** Any of the following freezes new market assignment to the offending resolver pubkey and forces a Council review: 3 INVALID resolutions in a rolling 90-day window, ≥15% INVALID rate over the last 20 resolutions, or 3 overturned disputes in 90 days. Metrics are tracked by the indexer; a daily on-chain attestation PDA carries the frozen-resolvers set so the freeze is enforced program-side at the next resolution attempt.
 
 **Failsafe:** if the multisig fails to sign within `resolution_deadline + 7 days`, anyone can call the existing `ResolvePermissionless` instruction, which settles at the time-weighted EWMA of the last 24 hours of trading. Not as accurate as a correct resolution, but better than indefinite limbo.
 
@@ -229,8 +232,9 @@ All paths share dispute escalation: any disputed resolution ultimately lands at 
 
 ### Dispute mechanics
 
-- **V1:** 48-hour window after resolution; 0.5 SOL bond; Council 3-of-5 reviews within 72h. Upheld disputes return the bond + 0.25 SOL reward. Failed disputes forfeit the bond to insurance.
-- **V2:** bond scales with market TVL (`max(0.5 SOL, 0.1% of TVL)`). UMA-mode disputes route to UMA's optimistic oracle process.
+- **V1 YES/NO resolutions:** 48-hour window after resolution; 0.5 SOL bond; Council 3-of-5 reviews within 72h. Upheld disputes return the bond + 0.25 SOL reward. Failed disputes forfeit the bond to insurance.
+- **V1 INVALID resolutions:** 48-hour mandatory auto-ratification window with **zero-bond disputes** — any holder of a non-zero historical position can dispute for free. The resolution does NOT finalize until the window expires without an upheld dispute, at which point anyone can permissionlessly crank the finalize. This mirrors UMA's optimistic-oracle pattern (hard time-based finality regardless of dispute activity) for the highest-risk resolution mode.
+- **V2:** bond scales with market TVL (`max(0.5 SOL, 0.1% of TVL)`). UMA-mode disputes route to UMA's optimistic oracle process. INVALID-mode behaviour matches V1 (48h zero-bond window).
 
 ---
 
