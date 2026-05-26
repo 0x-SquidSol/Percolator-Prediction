@@ -112,14 +112,15 @@ Legacy perp slabs read `market_kind == 0` from zeroed reserved bytes — no migr
 
 ### 2.3 New instruction tags
 
-The wrapper's tag table has holes at 15, 16, 18, 22, 24, 25, 26, 31, 33+. We claim **35, 36, 37, 38**:
+The wrapper's tag table has holes at 15, 16, 18, 22, 24, 25, 26, 31, 33+. We claim **35, 36, 37, 38, 39**:
 
 | Tag | Name | V1 | V2 | Purpose |
 |---|---|:-:|:-:|---|
 | 35 | `InitPredictionMarket` | | ✓ | Permissionless market creation with SOL bond |
-| 36 | `ResolvePredictionMarket { outcome: u8 }` | ✓ | ✓ | Signer = `config.resolution_oracle`. Translates outcome → settlement price. |
-| 37 | `DisputeResolution { reason_hash: [u8; 32] }` | | ✓ | Raises dispute, extends `force_close_delay_slots`, slashes bond on uphold |
+| 36 | `ResolvePredictionMarket { outcome: u8 }` | ✓ | ✓ | Signer = `config.resolution_oracle`. For outcomes 1/2 (NO/YES) settles immediately; for outcome 3 (INVALID) sets a 48h ratification timer (§5.3). |
+| 37 | `DisputeResolution { reason_hash: [u8; 32] }` | | ✓ | Raises dispute, extends `force_close_delay_slots`, slashes bond on uphold. Bond requirement waived during the INVALID-mode ratification window (§5.3). |
 | 38 | `ClaimBond` | | ✓ | Permissionless refund of creator bond after dispute window |
+| 39 | `ResolveInvalidFinalize` | ✓ | ✓ | Permissionless finalizer for INVALID resolutions: anyone can crank once `ratification_deadline_unix` passes without an upheld dispute, firing `resolve_market_refund_not_atomic` (§2.6). |
 
 **Note:** we are NOT claiming a `SettlePosition` tag. `ForceCloseResolved` (tag 30) already does exactly that. We just rebrand it in the SDK as `settlePosition()`.
 
@@ -164,15 +165,51 @@ Instruction::ResolvePredictionMarket { outcome } => {
         return Err(PercolatorError::ExpectedSigner.into());
     }
 
+    // Resolver-position prohibition (audit safeguard, §5.3). Resolution
+    // oracle signer must not hold a position in this market — conflict-of-
+    // interest gate against the "resolve to dodge a losing position" attack
+    // vector. For multisig oracles, the off-chain indexer additionally
+    // verifies every member pubkey at tx-build time; the on-chain guard
+    // here catches the single-signer case.
+    let engine_ro = zc::engine_ref(&data)?;
+    if engine_ro.account_index_for_owner(a_oracle_signer.key).is_some() {
+        return Err(PercolatorError::ResolverHoldsPosition.into());
+    }
+
+    // Frozen-resolver gate (audit safeguard, §5.3 auto-rotation triggers).
+    // The keeper updates a daily attestation PDA carrying the set of
+    // resolver pubkeys frozen by the auto-rotation metric. Reject the
+    // resolve tx if the signer is currently frozen — Council review must
+    // run before they can resolve again.
+    require_resolver_not_frozen(program_id, a_oracle_signer.key)?;
+
     let clock = Clock::from_account_info(a_clock)?;
     if (clock.unix_timestamp as i64) < config.resolution_open_unix {
         return Err(PercolatorError::InvalidConfigParam.into());
     }
 
+    // INVALID branch (outcome=3) does NOT finalize immediately. It
+    // transitions the slab into a 48h RATIFYING_INVALID state (§5.3) so
+    // the lazy-resolver escape hatch carries the hardest path, not the
+    // easiest. Anyone holding a non-zero historical position can dispute
+    // with zero bond during the window. The engine refund-mode resolve
+    // (`resolve_market_refund_not_atomic`) fires only from
+    // `ResolveInvalidFinalize` (tag 39) once the deadline passes without
+    // an upheld dispute. Bond slash and fee redirect happen at proposal
+    // time so the finalize tx is non-financial.
+    if outcome == 3 {
+        config.resolution_outcome_pending = 3;
+        config.ratification_deadline_unix =
+            clock.unix_timestamp + RATIFICATION_WINDOW_SECS; // 48h
+        slash_creator_bond_partial(a_bond_pda, INVALID_BOND_SLASH_BPS)?; // 20%
+        redirect_protocol_fees_to_insurance(a_slab, &mut data)?;
+        state::write_config(&mut data, &config);
+        return Ok(());
+    }
+
     let resolved_price_e6: u64 = match outcome {
         1 => 1u64,                  // NO  (avoid 0 — trips InvalidAccountData guard)
         2 => 1_000_000u64,          // YES
-        3 => return resolve_invalid(&mut data, &mut config, clock.slot),  // refund branch
         _ => return Err(ProgramError::InvalidInstructionData),
     };
 
@@ -191,6 +228,8 @@ Instruction::ResolvePredictionMarket { outcome } => {
 }
 ```
 
+The companion `ResolveInvalidFinalize` handler (tag 39) is permissionless: any wallet can crank once `clock.unix_timestamp >= config.ratification_deadline_unix` and no dispute is upheld. It calls `engine.resolve_market_refund_not_atomic(now_slot)` and writes `config.resolution_outcome = 3`. Because the financial actions (partial bond slash, protocol-fee redirect) already happened at proposal time, this handler is a pure state-transition crank — anyone willing to pay the gas can fire it to unlock trader claims.
+
 ### 2.6 Invalid/refund mode
 
 `outcome == 3` is the catch-all for markets that cannot resolve YES or NO — the underlying event was cancelled, the resolution criteria became impossible to evaluate, or the resolver explicitly elects the refund branch.
@@ -202,7 +241,7 @@ We add **one new engine method**, `resolve_market_refund_not_atomic`, that trans
 - `engine.market_mode` transitions to `Resolved`, with the same `resolved_slot` / `current_slot` / `last_market_slot` bookkeeping as the normal resolve path. The `resolved_payout_*` snapshot fields are zero sentinels since refund mode has no terminal payout to distribute.
 - After resolution, the existing `force_close_resolved_not_atomic` path lets each user withdraw their preserved `capital` (plus any `reserved_pnl` / warmup reserves that terminal-close consolidates in the existing flow).
 
-Trading fees are NOT refunded — they were earned by LPs and the protocol during the market's life.
+**Fee handling on INVALID (audit safeguard).** LP and creator fee shares are retained — those parties bore real inventory and reputational risk during the market's life. The **protocol-share** of accumulated `trading_fee_bps` is redirected at INVALID-proposal time (§2.5) to the slab's `insurance_fund.balance`. Because `force_close_resolved_not_atomic` already debits the insurance fund proportionally when LP collateral is short, refunded traders receive their pro-rata share of the redirected protocol fees through the existing terminal-close claim path — no new claim instruction, no new accumulator, no new PDA. This removes the protocol's incentive to tolerate fee-farm-then-INVALID attacks while sparing LPs (who provided continuous LMSR liquidity service) and creators (already partial-slashed per §7.2). See §7.1 for the full fee-treatment table.
 
 Two engine-level invariants shape the scope:
 
@@ -403,9 +442,25 @@ The resolver mode appears as a badge on every market card (`Pyth-verified`, `Cre
 4. Resolution Council (3-of-5 multisig — three Percolator team, two external Solana figures published in docs) reviews within 72h.
 5. Council signs `ResolveDispute`:
    - If original outcome confirmed → disputer loses bond to insurance fund.
-   - If overturned → disputer gets bond back + 50% of treasury reward (0.25 SOL). Original resolver is publicly logged. **Three overturns within 90 days triggers admin rotation** per ops policy.
+   - If overturned → disputer gets bond back + 50% of treasury reward (0.25 SOL). Original resolver is publicly logged.
+
+**Resolver auto-rotation triggers (audit safeguard).** Any of the following freezes new market assignment to the offending `resolution_oracle` pubkey and forces Council review:
+- **3 INVALID resolutions** in a rolling 90-day window
+- **≥15% INVALID rate** over the last 20 resolutions (minimum sample size 5)
+- **3 overturned disputes** in 90 days
+
+Metrics live in the indexer's `resolver_rate_view` (§8.2); a daily on-chain attestation PDA carries the current "frozen-resolvers" set so the freeze is enforceable program-side at `ResolvePredictionMarket` entry, not just by social pressure. Council retains discretion on reinstatement — auto-freeze is not auto-removal, so honest catastrophic-news clusters (e.g. a sports-postponement wave) get reviewed rather than punished.
 
 **V2 dispute UX:** bond scales with market TVL (`max(0.5 SOL, 0.1% of TVL)`). Routes to UMA Optimistic Oracle for UMA-mode markets.
+
+**INVALID-mode auto-ratification (audit safeguard).** Unlike YES/NO resolutions, `outcome == 3` (INVALID) does NOT finalize immediately. The wrapper's `ResolvePredictionMarket` handler (§2.5) transitions the slab to `RATIFYING_INVALID` and arms a hard **48-hour timer**. During the ratification window:
+
+- Any wallet holding a non-zero historical position may file a dispute with **zero bond**. INVALID is the lazy-resolver escape hatch and must be the hardest path, not the easiest.
+- The Council reviews any dispute within 72h. If upheld → resolution reverts (bond slash and fee redirect reverse, slab returns to `LIVE`, resolver is publicly logged on `/predictions/resolutions`). If rejected → window continues.
+- After `ratification_deadline_unix` passes without an upheld dispute, anyone may permissionlessly crank `ResolveInvalidFinalize` (tag 39) to fire `resolve_market_refund_not_atomic` (§2.6) and unlock trader claims.
+- The creator-bond partial slash (20%, §7.2) and protocol-fee redirect (§7.1) happen at the INVALID-proposal moment, so the finalize tx is non-financial; the financial commitment lands when the resolver signs, with the window providing time-based finality protection rather than fund-protection.
+
+This mirrors UMA's optimistic-oracle pattern (hard time-based finality on every proposal regardless of dispute count) for the specific subset of resolution modes that carry the highest exploit risk.
 
 ---
 
@@ -484,8 +539,9 @@ Lives at `/create` (existing wizard) with a top toggle: `Perp | Prediction`.
 
 - `LIVE` — normal trading.
 - `LOCKED` — last 60 minutes before `resolution_timestamp`; no new positions, position close still permitted. Banner: *"Trading closes in 47:02. Resolution at 2026-12-31 12:00 UTC."*
-- `RESOLVING` — after `ResolvePredictionMarket` signed, dispute window open. Banner: *"This market resolved YES. Disputes open until 2026-01-02 12:00 UTC. [Dispute]"*
-- `RESOLVED` — terminal. `Claim` buttons. Banner: *"Resolved YES on 2026-12-31 by 0xAB...CD. Source: [link]. [View on Solscan]"*
+- `RESOLVING` — after `ResolvePredictionMarket` signed with outcome YES or NO, dispute window open. Green banner: *"This market resolved YES. Disputes open until 2026-01-02 12:00 UTC. [Dispute]"*
+- `RATIFYING_INVALID` — after `ResolvePredictionMarket` signed with outcome 3 (INVALID), 48h auto-ratification window open. **Amber banner** (higher-friction visual treatment than `RESOLVING`): *"This market has been proposed INVALID by the resolver. Ratification window closes 2026-01-02 14:00 UTC. Dispute for free during this window. [Dispute]"* The free-dispute affordance is the key UX distinction — no bond required, just an open position.
+- `RESOLVED` — terminal. `Claim` buttons. For YES/NO: *"Resolved YES on 2026-12-31 by 0xAB...CD. Source: [link]. [View on Solscan]"* For INVALID-finalized: *"This market resolved INVALID and was refunded. Trader collateral preserved; protocol fees returned via insurance fund (§7.1)."*
 - `UNWOUND` — emergency path. Red banner: *"This market failed to resolve and was unwound at mid-price. [Read the postmortem]"*
 
 ---
@@ -506,6 +562,8 @@ Total taken at trade time is `config.trading_fee_bps` (default 50 = 0.50%). Spli
 
 The on-chain mechanism is a small **fee-router PDA** on top of the existing trading-fee path. (Implementation note: extend the existing `trading_fee_bps` distribution logic to support a 3-way split via additional config fields.)
 
+**INVALID-mode fee treatment (audit safeguard).** On `outcome == 3` (INVALID) proposal, the protocol-treasury share of accumulated `trading_fee_bps` collected over the market's life is redirected to the slab's `insurance_fund.balance` at the moment the resolver signs `ResolvePredictionMarket` (§2.5). LP and creator fee shares are NOT clawed back — LPs provided continuous LMSR liquidity service and bore locked-capital risk; V2 creators are already partial-slashed (20%) per §7.2. Because `force_close_resolved_not_atomic` already debits the insurance fund proportionally when LP collateral is short, refunded traders receive their pro-rata share of the redirected protocol fees through the existing terminal-close claim path — zero new on-chain accumulator, zero new claim instruction. This matches the Polymarket convention (collateral returned, fees kept by LPs) while adding a "we failed you" signal from the protocol's own fee cut.
+
 ### 7.2 V2 launch deposit: 5 SOL
 
 **Recommended: 5 SOL** (~$1000 at recent prices).
@@ -519,11 +577,14 @@ Justification:
 
 | Scenario | Bond outcome | LP outcome | Trader outcome |
 |---|---|---|---|
-| Clean resolution, no dispute | Full refund after 7d | Claim normally | Claim normally |
+| Clean YES/NO resolution, no dispute | Full refund after 7d | Claim normally | Claim normally |
+| INVALID resolution (outcome=3), ratification window expires without upheld dispute | **20% slash to insurance**, 80% returned after 7d | Position detached at entry (§2.6); claim collateral normally; LP fee share retained | Position detached at entry; pro-rata share of redirected protocol fees received through existing claim path |
 | Resolution within SLA, dispute overturned | 50% slash to insurance, 50% to disputers | Re-settled per overturned outcome | Re-settled |
 | Missed SLA (no resolution by `deadline + grace`) | 50% slash to insurance, 50% returned | Emergency unwind at mid-price | Emergency unwind at mid-price |
-| Undefined resolution criteria (Council judges meaningless) | Full slash to insurance | Emergency unwind at mid-price | Emergency unwind at mid-price |
+| Undefined resolution criteria (Council judges meaningless) | Full slash to insurance | Emergency unwind at mid-price | Emergency unwind at mid-price + full fee refund (all three shares) |
 | Market never traded by `resolution_timestamp` | Full refund | n/a | n/a |
+
+The **20% INVALID slash** (audit safeguard) prices the refund branch above zero so creators cannot use it as a free escape when YES/NO becomes unfavorable. Calibrated between Polymarket's effective 0% (INVALID isn't a slash event there) and the "Missed SLA" row's 50% — INVALID is a voluntary and uncontested resolution mode unlike a missed SLA, so the slash is correspondingly smaller. Combined with the 48h auto-ratification window (§5.3), this turns INVALID from a free option into a costly emergency button while leaving room for honest "this event genuinely cannot be adjudicated" calls.
 
 **Soft floor:** creators can stake additional SOL into the bond (visible on the market page as `Creator stake: 10 SOL`) — costly-signal mechanism. No enforced minimum past 5 SOL; we display the stake prominently so traders can self-select toward serious creators.
 
@@ -572,6 +633,21 @@ status            TEXT       -- 'open' | 'upheld' | 'rejected'
 ```
 
 The existing `TradeIndexer.ts` continues to capture all trades — prediction-market trades come through the same `TradeCpi` path.
+
+**Resolver-rate view (audit safeguard for §5.3 auto-rotation triggers).** New materialized view `resolver_rate_view` over `prediction_resolutions`, aggregated per `resolver_pubkey`:
+
+| Column | Source |
+|---|---|
+| `resolver_pubkey` | `prediction_resolutions.resolver_pubkey` (group key) |
+| `total_resolutions` | count of rows |
+| `invalid_count` | count where `outcome = 3` |
+| `overturned_count` | join `prediction_disputes` where `status = 'upheld'` |
+| `invalid_rate_lifetime` | `invalid_count / total_resolutions` |
+| `invalid_rate_last_20` | rolling window over the most-recent 20 resolutions |
+| `last_invalid_at_unix` | max `resolved_at_unix` where `outcome = 3` |
+| `invalid_count_90d` | count where `outcome = 3 AND resolved_at_unix >= now - 90d` |
+
+Refreshed on every `prediction_resolutions` insert. Exposed at `/api/prediction/resolvers/[pubkey]` and on the `/admin/resolvers` dashboard. A separate **frozen-resolvers attestation PDA** (`["pred-frozen-resolvers"]`) mirrors the "should freeze" boolean per pubkey for the auto-rotation triggers; the keeper updates this attestation daily from the view, and `ResolvePredictionMarket` (§2.5) reads it via `require_resolver_not_frozen`.
 
 ### 8.3 API (Next.js `app/app/api/`)
 
@@ -681,7 +757,7 @@ V1 prediction markets don't need 4096 user slots. Each user is in ONE slot (thei
 
 ### 11.2 Worst exploit scenarios specific to prediction markets
 
-1. **Frontrun resolution.** Trader with non-public knowledge of outcome trades large size in the last hour. **Mitigation:** at `resolution_open_unix - 1 hour`, matcher widens spreads dramatically (configurable; default 5× baseline) AND admin can call a `PauseTrading` instruction (tag 39, new — minor addition) to freeze the matcher. Same mechanic Polymarket uses ("market closes 1 hour before resolution").
+1. **Frontrun resolution.** Trader with non-public knowledge of outcome trades large size in the last hour. **Mitigation:** at `resolution_open_unix - 1 hour`, matcher widens spreads dramatically (configurable; default 5× baseline) AND admin can call a `PauseTrading` instruction (tag 41, new — minor addition) to freeze the matcher. Same mechanic Polymarket uses ("market closes 1 hour before resolution").
 
 2. **Last-trade manipulation.** Trader pumps `p_yes_e6` to 0.99 in the final block before `ResolvePermissionless` fires (multisig unavailable), then settles at the manipulated price. **Mitigation:** for `market_kind == 1`, `ResolvePermissionless` settles at the **time-weighted EWMA** of `p_yes_e6` over the last 24 hours, using the existing `mark_ewma_e6` infrastructure.
 
@@ -804,7 +880,7 @@ Publish a public `/predictions/readiness` dashboard tracking each metric. Holds 
 
 | Workstream | Effort | Notes |
 |---|---|---|
-| `percolator-prog` wrapper: `ResolvePredictionMarket` + V13 layout + band carve-out | 2-3 weeks senior eng | Includes Kani proof updates |
+| `percolator-prog` wrapper: `ResolvePredictionMarket` + `ResolveInvalidFinalize` (tag 39) + resolver-position prohibition + frozen-resolver gate + 20% bond slash + protocol-fee redirect + V13 layout + band carve-out | 3-4 weeks senior eng | Includes Kani proof updates and the audit-safeguard wrapper logic for INVALID ratification (§2.5, §5.3, §7.1, §7.2) |
 | `percolator` engine: `resolve_market_refund_not_atomic` + per-account detach helper | 2-3 weeks senior eng | ~300–500 lines including the Kani harness in `tests/proofs_prediction.rs`; see §2.6 for the design split |
 | `percolator-match-pred` LMSR binary | 3-4 weeks senior eng | Fixed-point log/exp + Remez approximations are the hard part |
 | `percolator-keeper`: `predictionResolution` + `predictionSettle` services | 2 weeks | TS, mostly straightforward |
@@ -893,10 +969,11 @@ The underlying transitions `LIVE → LOCKED → RESOLVING → RESOLVED` (§6.5).
 | `LIVE` | Normal trading. Oracle = 150-slot TWAP of underlying `p_yes_e6`. |
 | `LOCKED` (last 60 min before underlying resolution) | Perp halts new positions; close-only. Banner mirrors underlying countdown. Configurable per-market via `perp_locks_with_underlying: bool` (default `true`). |
 | **Pre-resolution perp-only halt** | Perp trading closes **4 hours** before underlying's `resolution_open_unix` — *wider* than the underlying's 60-min lock because perp positions are leveraged and terminal-snap is binary. |
-| `RESOLVING` | **Terminal-snap force-close.** Keeper calls `ForceCloseResolved` (tag 30) with `resolved_price = underlying.config.resolution_outcome → {1, 1_000_000}` per §2.5. Every open perp position settles at the terminal probability. |
-| `RESOLVED` with `outcome = 3` (INVALID) | **Perp inherits INVALID.** Calls `resolve_market_refund_not_atomic` (the engine method from §2.6). Open positions detached at zero unrealized PnL, collateral preserved. Trading fees stay with LPs and the protocol. |
+| `RESOLVING` (underlying YES/NO finalized) | **Terminal-snap force-close.** Keeper calls `ForceCloseResolved` (tag 30) with `resolved_price = underlying.config.resolution_outcome → {1, 1_000_000}` per §2.5. Every open perp position settles at the terminal probability. |
+| `RATIFYING_INVALID` (underlying entered §6.5's 48h INVALID ratification window) | **Perp ALSO halts new positions; close-only.** Cannot terminal-snap yet — the underlying could still revert if the Council upholds a dispute. Banner mirrors underlying's amber "INVALID proposed" treatment. |
+| `RESOLVED` with `outcome = 3` (INVALID, ratification window expired without upheld dispute) | **Perp inherits INVALID.** Keeper detects the `ResolveInvalidFinalize` (tag 39) event on the underlying and calls `resolve_market_refund_not_atomic` (the engine method from §2.6) on every linked perp slab. Open positions detached at zero unrealized PnL, collateral preserved. LP and creator trading fees retained on the perp slab; protocol fees redirected to the perp's own insurance fund (mirrors §7.1 on the perp). **Settlement delay:** perp terminal close fires only after the 48h underlying ratification window expires — there is no terminal-snap on `RATIFYING_INVALID` because the underlying outcome is not yet final. |
 
-The lifecycle hook lives in **`predictionSettle.ts`** (§8.1): on observing a `ResolvePredictionMarket` event for slab X, the keeper looks up all `market_kind = 2` slabs with `config.underlying_slab == X` and queues `ForceCloseResolved` for each.
+The lifecycle hook lives in **`predictionSettle.ts`** (§8.1): for YES/NO finalizations it observes the `ResolvePredictionMarket` event for slab X and queues `ForceCloseResolved` against every linked perp; for INVALID finalizations it observes `ResolveInvalidFinalize` (tag 39) instead, ignoring the earlier `ResolvePredictionMarket` proposal so as not to pre-snap perps before the ratification window closes.
 
 ### 15.5 Margin parameters & the bounded-domain insight
 
@@ -1032,7 +1109,7 @@ Checkbox required to enable `Continue`. Dismiss is one-time per wallet — never
 |---|---|---:|---|
 | `market_kind = 2` constant + carve-out in `TradeCpi` | `percolator-prog/src/percolator.rs:7518-7540` | ~30 | Same band floor as `market_kind = 1` |
 | Oracle adapter (`read_underlying_p_yes_twap_e6`) | `percolator-prog/src/percolator.rs` (new) | ~150 | Ring buffer + clamp + depth + staleness checks |
-| `LinkUnderlying` instruction (tag **39**) | `percolator-prog/src/percolator.rs` | ~80 | Binds `config.underlying_slab` once at perp init; admin-only in V3, permissionless in V3.1 with bond |
+| `LinkUnderlying` instruction (tag **40**) | `percolator-prog/src/percolator.rs` | ~80 | Binds `config.underlying_slab` once at perp init; admin-only in V3, permissionless in V3.1 with bond |
 | `MarketConfig` tail extension (no V-bump) | `MarketConfig` (§2.2) | ~40 | `underlying_slab: [u8; 32]`, `perp_locks_with_underlying: bool`, 150-slot TWAP ring |
 | Lifecycle hook | `percolator-keeper/src/services/predictionSettle.ts` | ~120 | Fan-out from underlying resolution to dependent perps |
 | Engine | — | **0** | 5x cap is just margin params; refund path already exists from §2.6 |
