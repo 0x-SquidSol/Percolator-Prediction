@@ -42,7 +42,7 @@ If the trader buys $50 of 3x long at p = 0.42 implied:
 - They post $50 USDC margin.
 - Their notional exposure is ~$150 of long-probability.
 - If the probability moves 0.42 → 0.50, they make ~57% on margin (~$28).
-- If the probability moves to ~0.31, they get liquidated and lose their margin.
+- If the probability moves to ~0.32, they get liquidated and lose their margin.
 
 **3. Liquidity providers (LPs) make the market.** LPs deposit USDC into the perp's tranche and earn a share of trading fees. Capital is locked for the lifetime of the underlying Polymarket market plus a 48-hour buffer (covers Polymarket's UMA dispute window and our orderly-unwind grace) — LPs cannot bail out mid-flight.
 
@@ -83,17 +83,17 @@ That's the entire loop.
 +----------------------------------------------------------------+
 |                                              | LONG  |  SHORT  |
 |  Implied probability (TWAP, last 30d)        +-----------------+
-|                                              | Lev: 1 2 3 [5]  |
+|                                              | Lev: 1 2 [3] 5  |
 |  60% ┤                              ╭───     |       def 2     |
-|      │                          ╭───╯        | Size: $___      |
+|      │                          ╭───╯        | Size: $50       |
 |  42% ┤───────────────────────╭───╯ <- now    | Mark: 0.420     |
-|      │                  ╭────╯               | Liq:  0.310     |
-|  31% ┄ liq (red dashed) ─ ─ ─ ─ ─ ─ ─ ─      | Max loss: $50   |
+|      │                  ╭────╯               | Liq:  0.322     |
+|  32% ┄ liq (red dashed) ─ ─ ─ ─ ─ ─ ─ ─      | Max loss: $50   |
 |      │                                       | Funding: 0.00%  |
 |   0% ┴────────────────────────────────       +-----------------+
 |     Apr     May    Jun    Jul    Now         | If you hold to  |
 |                                              | resolution:     |
-|  Volume 24h: $84k · Open interest: $312k     |   YES -> $238   |
+|  Volume 24h: $84k · Open interest: $312k     |   YES -> $257   |
 |  Creator fee: 5% (to @creator.sol)           |   NO  -> $0     |
 |                                              +-----------------+
 |                                              | [ Open Long ]   |
@@ -110,8 +110,8 @@ When the underlying Polymarket market resolves, holders see an in-app banner on 
 ```
 +----------------------------------------------------------------+
 | Polymarket resolved YES — "Will BTC close above $150k?"        |
-| Your 3x long settled at $1.00. You have $238.10 to claim.      |
-| [ Claim $238.10 ]   [ View market ]                            |
+| Your 3x long settled at $1.00. You have $257.14 to claim.      |
+| [ Claim $257.14 ]   [ View market ]                            |
 +----------------------------------------------------------------+
 ```
 
