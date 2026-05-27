@@ -1,28 +1,27 @@
 # Prediction Markets on Percolator — Integration Proposal
 
-**Authors:** Lead engineer + PM/UX specialist + DeFi engineering specialist (3-person design pod)
-**Status:** Draft v1 — for internal review
-**Scope:** End-to-end proposal for integrating prediction markets into the Percolator protocol. Covers product positioning, user journeys, on-chain mechanics, risk-engine reuse, resolution oracle design, fee economics, and rollout plan (V1 admin-gated → V2 permissionless).
+**Status:** Draft v2 — for internal review
+**Scope:** End-to-end proposal for integrating leveraged perpetual futures on Polymarket prediction markets into the Percolator protocol. Covers product positioning, on-chain mechanics, the Polymarket oracle bridge, risk-engine reuse, fee economics, off-chain services, and a phased rollout (V1 team-launched → V2 permissionless).
 
 ---
 
 ## TL;DR (executive summary)
 
-1. **Prediction markets fit the existing Percolator engine as a configuration variant of the perp slab, not a new program.** Engineering verification against the production `percolator-prog` wrapper confirms that `ResolveMarket` (tag 19), `ResolvePermissionless` (tag 29), and `ForceCloseResolved` (tag 30) already implement most of the settlement state machine we'd otherwise have to build. The new on-chain surface is ~1,300 lines net: 4 new instruction tags, one new matcher binary (LMSR), 64 bytes appended to `MarketConfig`, one new engine method.
+1. **Percolator provides Solana-native leverage on Polymarket prediction markets.** Traders open up to 5x perpetual positions on the implied probability of any Polymarket market — long if they think the probability will move up, short if down. They can close anytime, get liquidated if the underlying moves against them past their margin buffer, or hold to Polymarket's terminal resolution where the position snaps to 0 or 1.
 
-2. **One product, two flavors.** A prediction market is a slab with `market_kind = 1`. The trader, LP, and admin journeys live in the existing site IA (`/markets`, `/portfolio`, `/my-markets`) with a top-level Perps/Predictions tab. Brand stays unified; the pitch becomes "*pump.fun for perps. Polymarket for everything else.*"
+2. **The matcher and engine are reused.** No new matcher binary, no native prediction-market resolution authority, no dispute system on our side. The active `dcccrypto/percolator-match` oracle-anchored spread quoter is fed a Polymarket-derived probability and behaves exactly as it does today for any other perp. The `dcccrypto/percolator` risk engine's existing `resolve_market_refund_not_atomic` method (already shipped on the `feat/prediction-markets` branch) handles Polymarket-INVALID inheritance and oracle-death emergency unwind on the same code path.
 
-3. **V1: admin-gated, 4-market launch slate, Squads 3-of-5 multisig as resolution authority. No US-election markets in the V1 slate.** Reasons: brand-risk asymmetry while user base is small; lets us build resolution muscle memory on lower-stakes markets first.
+3. **One new on-chain primitive: the Polymarket oracle adapter.** A keeper-signed snapshot mechanism fed by a hybrid oracle source — Pyth where available, custom keeper for the long tail, Switchboard as a middle-ground option. The wrapper verifies signer + monotonic timestamp + deviation guard before the engine consumes the price.
 
-4. **V2: permissionless market creation, 5 SOL creator bond, hybrid resolver model.** Creator picks a resolver mode at launch (Pyth for price-conditional markets, creator-attested for low-TVL, UMA Optimistic Oracle for high-TVL, Percolator Council for max-trust). Disputes escalate to Council 3-of-5.
+4. **V1: team-launched perps on Polymarket's largest markets.** Phase 1 targets markets whose underlying is a Pyth-feed price threshold (e.g., "BTC closes above $X on date Y") — Pyth provides the oracle, no custom infrastructure required. ~6-12 launch markets, hand-curated.
 
-5. **Trading fees split three ways**: Protocol / Creator / LP. V1 defaults Protocol 70 / LP 30 (creator = treasury). V2 defaults Protocol 30 / Creator 40 / LP 30. Hard min on LP (15%) prevents fee-stripping.
+5. **V2: permissionless launches with up to 8% creator fees.** Anyone bonds 10 SOL plus a market seed deposit and launches a perp on any Polymarket market. Creator earns up to 8% of trading fees. The bond is slashable on protocol-defined misbehavior (binding to a manipulable underlying, sudden launch-then-bail patterns) but NOT on Polymarket-side resolution outcomes.
 
-6. **Leverage cap: 2x.** `initial_margin_bps = 5000`, `maintenance_margin_bps = 3300`. Higher leverage doesn't add useful product to binary markets and dramatically widens insurance tail risk (Polymarket and Kalshi run 1x).
+6. **Leverage cap: 5x.** Bounded-domain math gives closed-form worst-case loss per unit. The engine enforces an asymmetric leverage clamp: full 5x at implied `p ∈ [0.20, 0.80]`, 2x at `p ∈ [0.10, 0.20] ∪ [0.80, 0.90]`, opens rejected entirely outside `[0.10, 0.90]`.
 
-7. **LMSR matcher binary** (`percolator-match-pred`, ~800 lines), reuses the existing `MatcherCall`/`MatcherReturn` ABI so the wrapper's `TradeCpi` path doesn't change.
+7. **Net new on-chain code: ~700 lines.** Wrapper-side oracle adapter + four new instructions (`LinkPolymarketMarket`, `PushOracleSnapshot`, `TerminalSnap`, `EmergencyUnwind`, plus a Council-gated `EmergencyRelink`). Engine and matcher unchanged from existing production code.
 
-8. **Net new code is small and auditable.** 4-week single-senior-auditor engagement should suffice (~$50-80k).
+8. **Audit scope is small.** ~3-4 weeks single senior auditor for the new wrapper surface, plus a one-time `percolator-match` conformance audit for the bounded `[0, 1]` price domain. Materially smaller than a native-prediction-markets build because the resolver / dispute / matcher attack surface lives at Polymarket, not at us.
 
 ---
 
@@ -30,316 +29,254 @@
 
 ### 1.1 The pitch
 
-Percolator today is **"pump.fun for perps"** — a permissionless venue where anyone deploys a leveraged perp in a single wizard step. Prediction markets are a natural extension: a market in which the underlying has a **known terminal value (0 or 1) at a known future time**. We reuse the slab, the matcher CPI, the insurance fund, the fee router. What changes is (a) the price domain (bounded to [0, 1]), (b) the oracle (resolver instead of continuous price feed), (c) the lifecycle (markets end).
+**External:** *"Up to 5x perpetual leverage on any Polymarket market. Launch your own perp on any market and earn fees."*
 
-**External pitch:** *"Percolator Predictions — Solana-native event markets, settled on-chain, launched by anyone."*
-- vs. Polymarket: faster (Solana, not Polygon), permissionless (not US-geofenced).
-- vs. Kalshi: not CFTC-gated.
-- vs. Augur: actually usable.
+Percolator is a coin-margined perpetual futures protocol on Solana. We give traders leverage on price-shaped, derivative-shaped, and event-shaped underlyings. Prediction markets are a natural next category — Polymarket has thousands of markets with multi-billion-dollar historical volume, and there is no leverage layer on top of them today. We provide that layer.
 
-### 1.2 One product, two flavors
+**Competitive frame:**
 
-These are **one product with two flavors**, not two products. Rationale:
-- Same trader uses both. A SOL-perp trader will happily punt $200 on "Fed cuts in June."
-- Insurance LPs, keepers, indexer are shared infra — splitting fragments liquidity.
-- The slab IS a market; whether it's perp or prediction is a config bit.
+- **vs. Polymarket directly:** we add leverage and Solana speed onto the same markets. Traders keep using Polymarket for spot exposure; they use Percolator when they want leveraged exposure to the *path* the probability takes between launch and resolution.
+- **vs. coin-margined SOL/USD perps (Drift, dYdX, Hyperliquid):** we trade what they can't — markets whose underlying is an event, an opinion, or a soft signal rather than a unit-of-account price.
 
-**Surfacing is differentiated:**
-- Top-nav inside `/markets` gains a type-toggle: `Perps | Predictions`.
-- `/trade/[slab]` reads `market_kind` and renders different right-rail (YES/NO buy box vs leverage slider).
-- New short-URL route `/p/<slug>` for socially-shareable prediction markets, with OG cards.
+We are not displacing Polymarket; we are extending their universe of underlyings onto a leverage primitive they do not natively offer.
+
+### 1.2 One product, one launchable shape
+
+Single product, single launchable shape: a perp slab with `market_kind = 2` (PerpOnPolymarket) bound to a specific Polymarket market via the oracle adapter. The trader UI is a single trade page; the launcher UI is a single discovery + wizard flow. No native prediction-spot product, no native LMSR matcher, no native resolution authority.
+
+The slab is the matcher's home; the matcher feeds it a Polymarket-derived probability; the engine handles margin and liquidation as it does today for any other perp.
 
 ### 1.3 Brand-risk framing
 
-Prediction markets attract Kalshi-style regulatory attention and Polymarket-style reputational risk (election-night disputes). The Percolator brand is clean today. **V1's admin-gated phase exists primarily to protect the brand**, not to protect the engine. We say so explicitly in the public roadmap.
+Polymarket is CFTC-regulated and US-geofenced. We provide a Solana-side derivative on their markets. The brand-risk story is meaningfully different from a native-prediction-markets product:
+
+- **We do not resolve.** Polymarket resolves; UMA handles disputes. Our protocol inherits whatever outcome Polymarket finalizes. We have no resolver-as-attacker surface, no dispute-bond-gaming surface, no fee-farm-then-INVALID surface.
+- **We do have a curated-launch V1.** Even though we don't resolve, we choose which Polymarket markets get a perp listed against them. V1 is team-curated; V2 is permissionless with a bond + cooling-pool soft moderation.
+- **Counsel sign-off required before V1 launch.** A leveraged derivative on a CFTC-watched venue that is globally accessible from Solana has non-zero regulatory exposure. The framing "we are a leverage layer on Polymarket, Polymarket runs the underlying" helps but is not a shield. V1 geofencing decisions should mirror Polymarket's geofencing where possible.
 
 ---
 
 ## Section 2 — On-chain architecture
 
-### 2.1 Recommended shape: special perp configuration (Option B)
+### 2.1 Recommended shape: a configuration variant of the perp slab
 
-After reviewing the production wrapper end-to-end, the cleanest architecture is **Option B: a `market_kind: u8` discriminator added to `MarketConfig`**, NOT a new program (Option C) and NOT a bifurcated trading path (Option A).
+Add `market_kind = 2` (PerpOnPolymarket) to the existing `MarketConfig` discriminator. A PerpOnPolymarket slab is a standard perp slab with three differences:
 
-**Why:**
-- `MarketConfig` already carries every field a prediction market needs: `collateral_mint`, `vault_pubkey`, `index_feed_id`, `last_effective_price_e6`, `mark_ewma_e6`, `permissionless_resolve_stale_slots`, `force_close_delay_slots`.
-- The slab is already a `u64 price_e6` paired with a signed `i128 size`. A YES share is a long position at implied probability `p_e6 ∈ [0, 1_000_000]`. PnL accrual works unchanged: `pnl = size × (mark - entry) / 1e6`.
-- `ResolveMarket` already snapshots a final `resolved_price` into the engine. For prediction markets, the resolved price IS the outcome: `1_000_000` for YES, `1` for NO. Settlement = existing `force_close_resolved_with_fee_not_atomic`, which already computes `payout = collateral + size × (resolved_price - entry_avg) / 1e6`.
-- The wrapper-side `TradeCpi` band check (`|exec - oracle| × 10_000 ≤ max(2 × trading_fee_bps, 100) × oracle`) works identically when "oracle" is the implied probability.
+- The matcher is fed a Polymarket-derived probability (via the oracle adapter, §3) instead of a SOL/USD oracle reading.
+- The slab is bound to a specific Polymarket market via `polymarket_condition_id`.
+- Margin parameters are tuned for the bounded `[0, 1]` probability domain (5x cap, asymmetric clamp — see §4.3).
 
-**Option A (bifurcated trading path) is rejected because** it forks the engine's hot path. Every trade/crank/liquidate/resolve handler grows a `match config.market_kind` and breaks the Kani proofs.
+Engine code, matcher binary, insurance fund, and ADL machinery are unchanged. The new work is concentrated in the wrapper (`percolator-prog`) — primarily the oracle adapter — and in the off-chain stack (`percolator-keeper`, `percolator-indexer`) that feeds it. Engine and matcher reuse is the load-bearing architectural property.
 
-**Option C (new program) is rejected because** the risk engine (`percolator` crate) is `no_std` and deliberately consumed only by `percolator-prog`. A new program would either re-link the engine (forking ABI state) or CPI into the existing slab via existing tags (adding no value). Deploys also multiply.
+### 2.2 `MarketConfig` field set under the pivot
 
-### 2.2 `MarketConfig` additions (V13 layout)
+An earlier wrapper commit on `feat/prediction-markets` introduced the V13 `MarketConfig` layout for a then-planned native-prediction-markets product. Under the current scope several fields are retained for layout compatibility but flagged as deprecated:
 
-Append 64 bytes to the tail of `MarketConfig`, bumping `SlabHeader::version` from 12 to 13:
+| Field | Status under pivot |
+|---|---|
+| `market_kind: u8` | KEEP — discriminator (0 = Perp, 1 = reserved for future native prediction, 2 = PerpOnPolymarket) |
+| `resolution_oracle: [u8; 32]` | REPURPOSE as `oracle_keeper_authority` — the multisig signer authorized to push oracle snapshots for `market_kind = 2` |
+| `resolution_open_unix`, `resolution_deadline_unix` | DEPRECATE — Polymarket controls timing; we read these from the oracle adapter, not from on-chain config |
+| `creator_bond_lamports` | KEEP — V2 launcher bond (10 SOL) |
+| `resolution_outcome: u8` | KEEP — mirrors Polymarket's terminal outcome locally (0 = unresolved, 1 = NO, 2 = YES, 3 = INVALID/refund) |
+| `resolution_outcome_pending`, `ratification_deadline_unix`, `dispute_window_slots` | DEPRECATE — no native ratification or dispute under the pivot |
+
+Three new fields land in a follow-up wrapper commit:
 
 ```rust
-// === Prediction-market extension (V13 layout) ===
-/// 0 = Perp (legacy default), 1 = PredictionBinary, 2 = PredictionMulti (V2+).
-pub market_kind: u8,
-pub _pad_kind: [u8; 7],
+/// Polymarket condition-id this perp is bound to. Set at LinkPolymarketMarket
+/// time, immutable thereafter (except via the Council-gated EmergencyRelink
+/// admin path).
+pub polymarket_condition_id: [u8; 32],
 
-/// Resolution oracle pubkey. For PredictionBinary, the SIGNER required
-/// to call ResolvePredictionMarket. Distinct from existing hyperp_authority
-/// (which only pushes hyperp mark prices). Burnable post-resolution.
-pub resolution_oracle: [u8; 32],
+/// Oracle source discriminator. 0 = Pyth, 1 = custom keeper, 2 = Switchboard.
+/// Determines which oracle-pusher's signature the wrapper accepts at
+/// PushOracleSnapshot time.
+pub oracle_source: u8,
+pub _pad_oracle_source: [u8; 7],
 
-/// Unix timestamp at which resolution window opens.
-/// ResolvePredictionMarket rejects before this.
-pub resolution_open_unix: i64,
-
-/// Unix timestamp after which permissionless settlement kicks in
-/// if the resolution oracle has not acted.
-pub resolution_deadline_unix: i64,
-
-/// Dispute window in slots between ResolvePredictionMarket and when
-/// ForceCloseResolved becomes callable. Mirrors existing
-/// force_close_delay_slots but is the OUTCOME dispute period specifically.
-pub dispute_window_slots: u64,
-
-/// V2 only: SOL bond required to launch. Refunded on clean resolution.
-pub creator_bond_lamports: u64,
-
-/// Outcome encoding once resolved:
-///   0 = unresolved, 1 = NO, 2 = YES, 3 = INVALID (refund mode).
-pub resolution_outcome: u8,
-pub _pad_outcome: [u8; 7],
+/// Symbolic-bounded ring buffer of the last 60 oracle snapshots for TWAP
+/// computation. Each entry is { p_yes_e6: u64, source_timestamp: i64,
+/// on_chain_slot: u64 }. Tail-padded to keep MarketConfig 16-byte aligned.
+pub oracle_ring_buf: [OracleSnapshotEntry; 60],
 ```
 
-Legacy perp slabs read `market_kind == 0` from zeroed reserved bytes — no migration needed.
+The ring buffer lives in-config rather than in a separate PDA so the matcher CPI can read it without an extra account-meta entry, matching the existing single-account read pattern for `last_effective_price_e6`. A 60-entry ring at 5-second nominal cadence gives a 5-minute TWAP window — long enough to defeat single-block manipulation, short enough that genuine news moves through quickly.
 
 ### 2.3 New instruction tags
 
-The wrapper's tag table has holes at 15, 16, 18, 22, 24, 25, 26, 31, 33+. We claim **35, 36, 37, 38, 39**:
+The wrapper tag table has holes; we claim **40, 41, 42, 43, 44**:
 
 | Tag | Name | V1 | V2 | Purpose |
 |---|---|:-:|:-:|---|
-| 35 | `InitPredictionMarket` | | ✓ | Permissionless market creation with SOL bond |
-| 36 | `ResolvePredictionMarket { outcome: u8 }` | ✓ | ✓ | Signer = `config.resolution_oracle`. For outcomes 1/2 (NO/YES) settles immediately; for outcome 3 (INVALID) sets a 48h ratification timer (§5.3). |
-| 37 | `DisputeResolution { reason_hash: [u8; 32] }` | | ✓ | Raises dispute, extends `force_close_delay_slots`, slashes bond on uphold. Bond requirement waived during the INVALID-mode ratification window (§5.3). |
-| 38 | `ClaimBond` | | ✓ | Permissionless refund of creator bond after dispute window |
-| 39 | `ResolveInvalidFinalize` | ✓ | ✓ | Permissionless finalizer for INVALID resolutions: anyone can crank once `ratification_deadline_unix` passes without an upheld dispute, firing `resolve_market_refund_not_atomic` (§2.6). |
+| 40 | `LinkPolymarketMarket` | ✓ | ✓ | Bind a perp slab to a Polymarket condition-id + oracle source. Admin-only in V1, permissionless-with-bond in V2. One-shot per slab. |
+| 41 | `PushOracleSnapshot` | ✓ | ✓ | Keeper-multisig-signed write of a fresh Polymarket-derived probability into the slab's ring buffer. Wrapper verifies signer + monotonic timestamp + deviation guard. |
+| 42 | `TerminalSnap` | ✓ | ✓ | Permissionless cranker. Fires when Polymarket reports a finalized outcome. Translates outcome → `resolved_price` and routes to the existing `ResolveMarket` (tag 19) settlement path. |
+| 43 | `EmergencyUnwind` | ✓ | ✓ | Permissionless cranker. Fires when the oracle is stale beyond the configured threshold. Settles every position at the last valid TWAP minus a 200 bps conservativeness haircut routed to insurance. |
+| 44 | `EmergencyRelink` | ✓ | ✓ | Council 3-of-5 timelocked tag for repointing a slab to a different oracle source if the original one becomes unreliable. 48h timelock waived under attested oracle-failure conditions. |
 
-**Note:** we are NOT claiming a `SettlePosition` tag. `ForceCloseResolved` (tag 30) already does exactly that. We just rebrand it in the SDK as `settlePosition()`.
+Tags 35-39 (previously reserved on the same branch for native-prediction-markets handlers `InitPredictionMarket`, `ResolvePredictionMarket`, `DisputeResolution`, `ClaimBond`, `ResolveInvalidFinalize`) are released back to the unclaimed pool.
 
-### 2.4 What changes in the existing wrapper
+### 2.4 Existing wrapper hot-path changes
 
-Only two real touches:
+Two surgical edits in the existing `TradeCpi` (tag 10) handler:
 
-1. **Band-check carve-out (~30 lines)** in the `TradeCpi` handler:
-   ```rust
-   if config.market_kind != 0 {
-       band_bps = max(band_bps, 200);  // 2% minimum band for prediction markets
-   }
-   ```
-   Rationale: at extreme implied probabilities (p_e6 ≈ 1000 = 0.1%), a 1% band is 10 e6-units — barely above rounding. Widen to 2% min.
+1. **Band-check carve-out (~30 lines)** — band floor widened to 200 bps for `market_kind = 2` markets. Probability extremes need wider absolute-tolerance bands; a 1% band at `p ≈ 0.99` is barely above rounding.
+2. **Oracle source for `read_price_and_stamp`** when `market_kind = 2` — read the TWAP-clamped value from `oracle_ring_buf` instead of an external Pyth/Hyperp source.
 
-2. **Oracle source for `read_price_and_stamp`** when `market_kind == 1`: instead of reading the external oracle, read the matcher context's `last_p_yes_e6` (set by the matcher on every fill). This is the matcher echoing back its marginal probability.
+Both changes are local and isolated to dispatch-time branching on `market_kind`.
 
-### 2.5 `ResolvePredictionMarket` handler (tag 36)
+### 2.5 `PushOracleSnapshot` handler (tag 41)
 
-Thin shim over the existing `ResolveMarket` path:
+The load-bearing new instruction. Pseudocode:
 
 ```rust
-Instruction::ResolvePredictionMarket { outcome } => {
+Instruction::PushOracleSnapshot { p_yes_e6, source_timestamp } => {
     accounts::expect_len(accounts, 4)?;
-    let a_oracle_signer = &accounts[0];
+    let a_keeper_signer = &accounts[0];
     let a_slab = &accounts[1];
     let a_clock = &accounts[2];
+    let a_second_source = &accounts[3]; // indexer-maintained second-source feed
 
-    accounts::expect_signer(a_oracle_signer)?;
+    accounts::expect_signer(a_keeper_signer)?;
     accounts::expect_writable(a_slab)?;
     let mut data = state::slab_data_mut(a_slab)?;
     slab_guard(program_id, a_slab, &data)?;
     require_initialized(&data)?;
 
     let mut config = state::read_config(&mut data);
-    if config.market_kind != 1 { return Err(ProgramError::InvalidInstructionData); }
-    if config.resolution_outcome != 0 { return Err(ProgramError::InvalidAccountData); }
+    if config.market_kind != 2 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
 
-    // Signer = resolution_oracle (NOT admin). The new authorization path.
+    // Signer must match the registered oracle keeper authority.
     let expected = Pubkey::new_from_array(config.resolution_oracle);
-    if a_oracle_signer.key != &expected {
+    if a_keeper_signer.key != &expected {
         return Err(PercolatorError::ExpectedSigner.into());
     }
 
-    // Resolver-position prohibition (audit safeguard, §5.3). Resolution
-    // oracle signer must not hold a position in this market — conflict-of-
-    // interest gate against the "resolve to dodge a losing position" attack
-    // vector. For multisig oracles, the off-chain indexer additionally
-    // verifies every member pubkey at tx-build time; the on-chain guard
-    // here catches the single-signer case.
-    let engine_ro = zc::engine_ref(&data)?;
-    if engine_ro.account_index_for_owner(a_oracle_signer.key).is_some() {
-        return Err(PercolatorError::ResolverHoldsPosition.into());
-    }
-
-    // Frozen-resolver gate (audit safeguard, §5.3 auto-rotation triggers).
-    // The keeper updates a daily attestation PDA carrying the set of
-    // resolver pubkeys frozen by the auto-rotation metric. Reject the
-    // resolve tx if the signer is currently frozen — Council review must
-    // run before they can resolve again.
-    require_resolver_not_frozen(program_id, a_oracle_signer.key)?;
-
     let clock = Clock::from_account_info(a_clock)?;
-    if (clock.unix_timestamp as i64) < config.resolution_open_unix {
-        return Err(PercolatorError::InvalidConfigParam.into());
+
+    // Monotonicity: the source timestamp must be strictly greater than the
+    // most recent entry in the ring buffer.
+    let last_entry = ring_buf_last(&config.oracle_ring_buf);
+    if source_timestamp <= last_entry.source_timestamp {
+        return Err(PercolatorError::NonMonotonicTimestamp.into());
     }
 
-    // INVALID branch (outcome=3) does NOT finalize immediately. It
-    // transitions the slab into a 48h RATIFYING_INVALID state (§5.3) so
-    // the lazy-resolver escape hatch carries the hardest path, not the
-    // easiest. Anyone holding a non-zero historical position can dispute
-    // with zero bond during the window. The engine refund-mode resolve
-    // (`resolve_market_refund_not_atomic`) fires only from
-    // `ResolveInvalidFinalize` (tag 39) once the deadline passes without
-    // an upheld dispute. Bond slash and fee redirect happen at proposal
-    // time so the finalize tx is non-financial.
-    if outcome == 3 {
-        config.resolution_outcome_pending = 3;
-        config.ratification_deadline_unix =
-            clock.unix_timestamp + RATIFICATION_WINDOW_SECS; // 48h
-        slash_creator_bond_partial(a_bond_pda, INVALID_BOND_SLASH_BPS)?; // 20%
-        redirect_protocol_fees_to_insurance(a_slab, &mut data)?;
-        state::write_config(&mut data, &config);
-        return Ok(());
+    // Domain clamp: p_yes_e6 must be in [10_000, 990_000] for engine math.
+    let clamped = p_yes_e6.clamp(POLY_CLAMP_LO, POLY_CLAMP_HI);
+
+    // Deviation guard: reject snapshots that deviate from the rolling TWAP by
+    // more than the configured threshold (default 300 bps). Combined with
+    // the second-source-disagreement check below, this is the primary
+    // defense against a compromised keeper.
+    let twap = ring_buf_twap(&config.oracle_ring_buf);
+    if abs_deviation_bps(clamped, twap) > MAX_ORACLE_DEVIATION_BPS {
+        return Err(PercolatorError::OracleDeviation.into());
     }
 
-    let resolved_price_e6: u64 = match outcome {
-        1 => 1u64,                  // NO  (avoid 0 — trips InvalidAccountData guard)
-        2 => 1_000_000u64,          // YES
-        _ => return Err(ProgramError::InvalidInstructionData),
-    };
+    // Second-source sanity check: the indexer maintains an independent
+    // Polymarket REST poll in a separate PDA; if it disagrees with the
+    // keeper-submitted price by more than the threshold, halt and require
+    // Council EmergencyRelink before further writes accepted.
+    let second_source = read_second_source_pda(a_second_source)?;
+    if abs_deviation_bps(clamped, second_source.p_yes_e6) > MAX_SECOND_SOURCE_DEVIATION_BPS {
+        return Err(PercolatorError::SecondSourceDisagreement.into());
+    }
 
-    config.resolution_outcome = outcome;
+    // Append the new entry, displacing the oldest.
+    ring_buf_push(&mut config.oracle_ring_buf, OracleSnapshotEntry {
+        p_yes_e6: clamped,
+        source_timestamp,
+        on_chain_slot: clock.slot,
+    });
     state::write_config(&mut data, &config);
-
-    let engine = zc::engine_mut(&mut data)?;
-    engine.resolve_market_not_atomic(
-        percolator::ResolveMode::Ordinary,
-        resolved_price_e6,
-        resolved_price_e6,
-        clock.slot,
-        0,  // funding_rate_e9 = 0 — prediction markets have no funding
-    ).map_err(map_risk_error)?;
     Ok(())
 }
 ```
 
-The companion `ResolveInvalidFinalize` handler (tag 39) is permissionless: any wallet can crank once `clock.unix_timestamp >= config.ratification_deadline_unix` and no dispute is upheld. It calls `engine.resolve_market_refund_not_atomic(now_slot)` and writes `config.resolution_outcome = 3`. Because the financial actions (partial bond slash, protocol-fee redirect) already happened at proposal time, this handler is a pure state-transition crank — anyone willing to pay the gas can fire it to unlock trader claims.
+`LinkPolymarketMarket`, `TerminalSnap`, `EmergencyUnwind`, and `EmergencyRelink` are each ~30-60 lines and follow the same pattern: signer verification, state transition, write.
 
-### 2.6 Invalid/refund mode
+### 2.6 Polymarket terminal-outcome inheritance
 
-`outcome == 3` is the catch-all for markets that cannot resolve YES or NO — the underlying event was cancelled, the resolution criteria became impossible to evaluate, or the resolver explicitly elects the refund branch.
+Polymarket markets terminate with one of three states:
 
-We add **one new engine method**, `resolve_market_refund_not_atomic`, that transitions the market from `Live` to `Resolved` while leaving every trader whole on their **open positions**. The mechanism, in plain language:
+- **YES** — the CTF token redeems for 1.0. Our perp's `TerminalSnap` translates to `resolved_price = 1_000_000` (engine e6 units) and routes through the existing `ResolveMarket` settlement path.
+- **NO** — CTF redeems for 0.0. `resolved_price = 1` (we avoid 0 to keep the existing `InvalidAccountData` guard semantic intact).
+- **INVALID** — UMA dispute outcome resolves the market as ambiguous; Polymarket sets `0.5/0.5` and traders redeem at half-and-half.
 
-- For any account with an **open position** at refund time: the position is detached at zero unrealized PnL (the "close at entry price" semantic). The position's contribution to the market's aggregate open-interest and stored-position-count is removed; the trader's `capital` is preserved.
-- For any account **without** an open position at refund time: the engine does nothing. Already-closed trades stay closed — a trader who took a profit (or loss) on an earlier trade and then closed before resolution keeps that realized result. This matches the convention used by Polymarket and Kalshi for INVALID resolution.
-- `engine.market_mode` transitions to `Resolved`, with the same `resolved_slot` / `current_slot` / `last_market_slot` bookkeeping as the normal resolve path. The `resolved_payout_*` snapshot fields are zero sentinels since refund mode has no terminal payout to distribute.
-- After resolution, the existing `force_close_resolved_not_atomic` path lets each user withdraw their preserved `capital` (plus any `reserved_pnl` / warmup reserves that terminal-close consolidates in the existing flow).
+For YES/NO our perp behaves like any other terminal-snap perp. For INVALID we cannot terminal-snap to a single price because the underlying split. The engine's existing `resolve_market_refund_not_atomic` method (already shipped on `feat/prediction-markets`) handles this — it detaches every open position at zero unrealized PnL, preserves trader collateral, and leaves protocol fees with LPs and the protocol. The same method also services the emergency-unwind path when our oracle becomes unreliable independent of any Polymarket resolution event.
 
-**Fee handling on INVALID (audit safeguard).** LP and creator fee shares are retained — those parties bore real inventory and reputational risk during the market's life. The **protocol-share** of accumulated `trading_fee_bps` is redirected at INVALID-proposal time (§2.5) to the slab's `insurance_fund.balance`. Because `force_close_resolved_not_atomic` already debits the insurance fund proportionally when LP collateral is short, refunded traders receive their pro-rata share of the redirected protocol fees through the existing terminal-close claim path — no new claim instruction, no new accumulator, no new PDA. This removes the protocol's incentive to tolerate fee-farm-then-INVALID attacks while sparing LPs (who provided continuous LMSR liquidity service) and creators (already partial-slashed per §7.2). See §7.1 for the full fee-treatment table.
-
-Two engine-level invariants shape the scope:
-
-1. **`oi_eff_long_q == 0 && oi_eff_short_q == 0` at resolve exit** — enforced by `assert_public_postconditions_fast`. Refund mode meets this by detaching every open position before the mode transition, NOT by deferring per-account work to `force_close_resolved_not_atomic`.
-
-2. **`sched_remaining + pending_remaining == reserved_pnl` per account** — the engine's reserve-shape invariant links warmup reserves and reserved positive PnL one-to-one. They are not separately drainable into `capital`. Refund mode therefore does NOT touch `reserved_pnl` or warmup reserves; terminal close handles them through the existing per-account consolidation.
-
-**Sizing note:** the engine method is implemented as a private per-account helper (`refund_detach_account`) plus the public `resolve_market_refund_not_atomic` that iterates active accounts and finalizes the side reset. Combined with the matching Kani proofs in `tests/proofs_prediction.rs`, total surface is closer to 300–500 lines across the engine crate. Still a small new surface relative to the rest of the engine, and well within the audit budget described in Section 11.
+The refund-mode engine work plus its Kani harness suite (covering empty market, single-account-no-position, single-account-with-position, two-account-bilateral, preservation-of-untouched-fields, and the four precondition-rejection cases) already cover this lifecycle. No new engine code is needed for terminal inheritance.
 
 ### 2.7 Insurance fund coverage
 
-The existing engine already handles "payout exceeds LP collateral":
-1. `ForceCloseResolved` debits LP collateral.
-2. If LP collateral hits zero, engine routes to `engine.insurance_fund.balance`.
-3. If insurance hits zero, ADL kicks in via `adl_mult_long` / `adl_mult_short` (existing perp-side machinery).
-
-This is exactly how perp insolvency works. **No new code in the engine.** We just need to size the insurance fund appropriately at market init (§4.5).
+Unchanged from the existing perp design. The engine handles "payout exceeds LP collateral" via `engine.insurance_fund.balance` → ADL via `adl_mult_long` / `adl_mult_short`. Insurance fund is sized at perp launch per §4.5.
 
 ---
 
-## Section 3 — Matcher: bounded AMM for binary outcomes
+## Section 3 — Polymarket oracle bridge
 
-### 3.1 The hard part isn't curve math, it's where the "oracle" comes from
+This is the load-bearing new piece. The matcher needs a probability value to quote off; that value has to come from Polymarket, which runs on Polygon, while we run on Solana. The oracle bridge is how we cross that gap.
 
-A subtle finding from the engineering audit: the existing `percolator-match` reference matcher is NOT a constant-product curve AMM. It's an **oracle-anchored spread quoter** — `exec_price = oracle × (1 ± total_bps/10_000)`. The "AMM" component is just an impact term added to a spread around an external oracle.
+### 3.1 The fundamental problem
 
-For prediction markets there's no external oracle to anchor on. The implied probability has to come from **on-chain matcher state**. That reframes the design question from "how do we clip x·y=k to [0,1]" to "how do we compute the implied probability from inventory."
+Polymarket markets are conditional tokens (CTFs) on Polygon. Their implied probability at any moment is the marginal price of the YES CTF token in Polymarket's AMM. There is no native Pyth feed for "the implied probability of Polymarket market X" because Pyth's publishers do not (today) publish that quantity.
 
-### 3.2 Curve choice: LMSR
+We therefore need to bridge Polygon → Solana for the price signal. Three approaches, each with trust trade-offs:
 
-Three candidates evaluated:
+### 3.2 Source A: Pyth (price-threshold markets)
 
-| Candidate | Pro | Con | Verdict |
-|---|---|---|---|
-| Constant-product clipped to [0,1] | Cheap (~600 CU), simple | Liquidity dries up near 0/1; slippage explodes | Reject |
-| **LMSR (Hanson)** | Bounded LP loss, smooth pricing, validated at Polymarket/Manifold scale | ~10k CU/trade for fixed-point log/exp | **PICK** |
-| Constant-power-product | Hybrid | No audited Solana implementation, no intuition advantage | Reject |
+For Polymarket markets whose underlying is a measurable on-Pyth quantity (price thresholds — "BTC closes above $150k on Dec 31"), we do not need to mirror Polymarket at all. We read the Pyth feed directly and compute the implied probability from the time-decay-toward-threshold function. The Polymarket market still exists; it just isn't the oracle.
 
-**LMSR wins on two load-bearing properties:**
-1. **LP max loss is finite and provable: `b × ln(2)`**. This is essential for `percolator-stake` integration — the senior tranche needs to know worst-case exposure to size its first-loss buffer.
-2. **Prices are well-defined at all inventories** including `(q_yes, q_no) = (0, 0)`, so no initialization hacks.
+Coverage: ~10-50 Polymarket markets at any time. Limited to the price-threshold genre. Fully trust-decentralized; Pyth's publisher set is the security model.
 
-The 10k CU overhead is acceptable (a perp trade today costs 50-80k CU end-to-end).
+Default for V1 launch slate.
 
-### 3.3 The new matcher binary: `percolator-match-pred`
+### 3.3 Source B: Custom keeper (sentiment / event markets)
 
-Sibling to `percolator-match`, implements the same `MatcherCall`/`MatcherReturn` ABI. Internal state extends `MatcherCtx` by repurposing the existing 112-byte `_reserved` tail:
+For markets whose underlying is sentiment ("Trump wins 2028 at p ≈ 0.42") there is no native Pyth feed. We run a keeper bot — a 2-of-3 Squads-multisigned service — that polls Polymarket's REST API and pushes a signed snapshot to the slab via `PushOracleSnapshot` every 5 seconds.
 
-```rust
-// Lives in the 112-byte _reserved tail of MatcherCtx for binary LMSR mode.
-#[repr(C)]
-struct BinaryLmsrState {
-    /// Liquidity parameter b in e6. Higher = deeper liquidity, more LP loss.
-    /// Typical: 10_000_000_000 e6 = 10k USDC equivalent.
-    pub b_e6: u128,
-    /// Net YES shares outstanding (signed; usually positive).
-    pub q_yes_e6: i128,
-    /// Net NO shares outstanding.
-    pub q_no_e6: i128,
-    /// Cached marginal price after last trade. Echoed to wrapper as
-    /// "oracle_price_e6" for the band check.
-    pub last_p_yes_e6: u64,
-    pub _reserved: [u8; 48],
-}
-```
+Trust model: the keeper signer is fully trusted to submit a Polymarket-faithful price. Mitigations:
 
-### 3.4 Pricing math (pseudocode)
+- **2-of-3 Squads multisig** required as `oracle_keeper_authority`, one external co-signer, monthly rotation.
+- **HSM-backed signing where feasible** (Turnkey, Fireblocks).
+- **On-chain per-slot move clip** (`max_price_move_bps_per_slot = 500` for keeper-sourced markets, tighter than Pyth's 2000).
+- **Indexer-maintained second-source PDA** (§7.2) that independently polls Polymarket; `PushOracleSnapshot` rejects any submission deviating by >300 bps from the second source.
+- **Canary trades** from a separate watcher account proving the keeper is honest (small, regular, scripted).
 
-```rust
-fn quote_yes_buy(state: &BinaryLmsrState, delta_shares_e6: u128)
-    -> (u64 /* exec_price_e6 */, u128 /* cost_e6 */)
-{
-    // Average price = (C_after - C_before) / Δ
-    // where C(q) = b · ln(exp(q_yes / b) + exp(q_no / b)).
-    let b = state.b_e6;
-    let q_y1 = state.q_yes_e6 + delta_shares_e6 as i128;
+This is the highest-risk surface in the protocol under the pivot.
 
-    let c0 = lmsr_cost_e6(b, state.q_yes_e6, state.q_no_e6);
-    let c1 = lmsr_cost_e6(b, q_y1, state.q_no_e6);
+### 3.4 Source C: Switchboard (middle ground)
 
-    let cost = (c1 - c0) as u128;
-    let exec_price = (cost * 1_000_000) / delta_shares_e6;
+Switchboard On-Demand can run a custom oracle job that scrapes Polymarket REST. Trust is improved relative to a 1-of-1 keeper (federated quorum of off-chain runners), but worse than Pyth's publisher economics. Latency is acceptable for our 5-minute TWAP window.
 
-    // Marginal price after trade — echoed as "oracle_price_e6" for band check.
-    let p_yes_after = sigmoid_e6((q_y1 - state.q_no_e6) / (b as i128));
-    (exec_price as u64, cost)
-}
-```
+Used in V2 as the default oracle for community-launched perps. Creators can upgrade to a custom keeper by posting an additional 25 SOL keeper-bond on top of the launch bond.
 
-`lmsr_cost_e6` and `sigmoid_e6` use degree-5 Remez polynomial approximations, error bound `< 2 e6-units` over `q/b ∈ [-20, 20]`. Outside that range we saturate to 999_999 / 1.
+### 3.5 Hybrid routing summary
 
-### 3.5 LP UX implications
+| Phase | Oracle defaults |
+|---|---|
+| V1 (team-launched, 6-12 markets) | Pyth for price-threshold markets, custom keeper for the rest. All 2-of-3 multisig. |
+| V2 (permissionless) | Switchboard On-Demand by default. Custom keeper available as a creator-upgrade with additional bond. |
 
-Unlike perp LPs (who can withdraw anytime), **prediction-market LP capital is locked until resolution.** Free-withdrawal would let an LP exit when the curve shifts adversely against them, a free option vs. traders. The UI shows this prominently — the deposit modal has a mandatory checkbox: *"I understand my liquidity is locked until <resolution_date>."*
+### 3.6 Emergency-unwind protocol (oracle-source-agnostic)
 
-LPs choose between two tranches (reusing `percolator-stake` infra):
-- **Junior LP** — bears first directional loss if traders win net, earns the bigger fee share.
-- **Senior LP** — capped upside, insurance-style protection.
+When the oracle becomes unreliable — regardless of source — the protocol must execute this sequence:
+
+1. **Detection.** Any of: staleness > `MAX_ORACLE_STALENESS_SLOTS` (~12 seconds), deviation > 300 bps vs second-source PDA, Pyth confidence-interval > 100 bps, Switchboard quorum below threshold, custom-keeper deviation alarm fires.
+2. **Halt.** `EmergencyUnwind` (tag 43) becomes permissionlessly callable; on call, the slab transitions to `EmergencyHalted` and new opens are rejected. Existing positions remain open at the last valid TWAP minus a 100 bps preliminary haircut.
+3. **15-minute grace window.** If the oracle resumes and the new reading agrees with the pre-halt TWAP within 100 bps, the slab auto-resumes.
+4. **Escalation at 15 minutes.** Council 3-of-5 has 2 hours to either (a) re-source the oracle via `EmergencyRelink` (tag 44), or (b) trigger orderly unwind.
+5. **Orderly unwind.** Every position closes at the last valid 24h EWMA minus a 200 bps conservativeness haircut routed to insurance. Never settle at zero. Never settle at last-trade. Never wait indefinitely.
+6. **Post-incident postmortem.** Mandatory within 7 days. The oracle source for that market type is reviewed and potentially downgraded for new markets.
+
+The non-negotiable property: **the protocol always has a terminal exit, even when its oracle is dead.** The 24h-EWMA-minus-haircut path is the deterministic exit, and the insurance fund eats the haircut. This is the single most important property of the protocol under the pivot — without it, a Polymarket-side hack would become a Percolator-side bank run.
+
+### 3.7 LP UX implications
+
+Perp LPs (junior + senior tranches of the existing `dcccrypto/percolator-stake` infra) deposit USDC and earn a share of trading fees. Capital is locked for the lifetime of the underlying Polymarket market plus a 48-hour buffer (mirrors Polymarket's UMA dispute window plus our orderly-unwind grace) and the existing per-tranche cooldown extends accordingly. Free withdrawal during this window would give LPs a free option versus locked traders.
 
 ---
 
@@ -347,654 +284,36 @@ LPs choose between two tranches (reusing `percolator-stake` infra):
 
 ### 4.1 Funding rate: zero, hard-coded
 
-For `market_kind == 1`, funding is meaningless. A YES share isn't oscillating around an external mark — its mark IS the implied probability of the same outcome.
+For `market_kind = 2`, the perp's oracle IS the underlying matcher mid (Polymarket-derived). There is no external "true price" to anchor a basis against, and holding the perp long is economically equivalent to holding YES CTF spot — funding would be a pure leverage tax on traders. Mirror the existing zero-funding pattern: `funding_k_bps = 0`, `funding_max_premium_bps = 0`, `funding_max_e9_per_slot = 0`. Engine funding code becomes a no-op for this market kind.
 
-**At `InitMarket` for prediction kinds:**
-- `funding_horizon_slots = u64::MAX`
-- `funding_k_bps = 0`
-- `funding_max_premium_bps = 0`
-- `funding_max_e9_per_slot = 0`
+The UI keeps the funding row visible (`Funding: 0.00% / 8h`) so we can enable it later — for example to discourage long-dated open interest pinning LP capital — without a frontend release.
 
-Existing funding code becomes a no-op. Zero new code in the engine.
+### 4.2 Liquidation: existing machinery, tightened price-move bound
 
-### 4.2 Liquidation: keep, with higher price-move tolerance
+The existing liquidation engine (`KeeperCrank` with `LiquidationPolicy::FullClose`) is the right primitive. Configuration tightens for the bounded-domain product:
 
-The existing liquidation engine (`KeeperCrank` with `LiquidationPolicy::FullClose`) is the right primitive. But the engine's `max_price_move_bps_per_slot` (default ~500 bps for perps) needs to be **wider** for prediction markets — real news events legitimately move implied probabilities 50%+ in a single slot (a debate gaffe, last-minute goal).
+- `max_price_move_bps_per_slot = 2_000` (20% per slot) — tighter than the perp default but looser than would suit a SOL/USD perp. The 5-minute TWAP smooths legitimate news; this clip catches manipulation attempts.
 
-**Recommended:** `max_price_move_bps_per_slot = 5_000` (50%/slot) for prediction markets. The engine still rejects truly absurd moves (>500%), preventing a malicious matcher from settling at 0.99 → 0.01 in adjacent slots.
+### 4.3 Margin parameters & the bounded-domain insight
 
-### 4.3 Margin: 2x max leverage
-
-| Param | Perp default | Prediction recommended |
-|---|---|---|
-| `initial_margin_bps` | 500 (20x) | **5,000 (2x)** |
-| `maintenance_margin_bps` | 250 | **3,300** |
-
-**Rationale:** Polymarket runs 1x. Kalshi runs 1x. Augur runs flexible but practically 1-2x. A single 50% probability move (on-distribution for real prediction markets) wipes a 2x position; higher leverage adds tail-risk without product value. 2x is a Percolator-native compromise that differentiates from Polymarket without recklessness.
-
-V2 can raise leverage per-market via creator config, capped at engine `MAX_INITIAL_MARGIN_BPS`.
-
-### 4.4 Position size cap
-
-Set `max_active_positions_per_side = 30%` of LP `b` (LMSR liquidity). Hard cap to keep any single position smaller than the LP's bounded loss budget.
-
-### 4.5 Insurance fund sizing
-
-At market init, the protocol seeds the slab's insurance fund proportional to the LMSR `b` parameter. Suggested formula:
-
-```
-insurance_seed = b × ln(2)  // = LP max loss, doubled as headroom
-```
-
-This guarantees that even if LPs go to zero, the insurance fund covers payouts up to the LMSR's bounded-loss limit.
-
----
-
-## Section 5 — Resolution oracle design
-
-### 5.1 V1 — Squads 3-of-5 multisig
-
-**Mechanism is already half-built.** The program has `SetOracleAuthority` and the slab has `oracle_authority`. We add a parallel `resolution_oracle` field (§2.2) and set it to a Squads 2-of-3 multisig at market launch. `ResolvePredictionMarket` (tag 36) requires that multisig signature.
-
-**Members (recommended):**
-- 2 founders
-- 2 engineering leads
-- 1 external advisor (rotating quarterly)
-
-**Audit trail UX:**
-- Every `ResolvePredictionMarket` event indexed and rendered on `/p/<slug>` as: `Resolved YES on 2026-12-31 14:02 UTC · signers: 0xab..1, 0xcd..2 · evidence: <url> · [view tx]`.
-- Global ledger at `/predictions/resolutions` — public Hall of Records, sortable by date and `was-disputed`.
-- Resolving admin's stat row on `/admin/resolvers`: count resolved / count disputed / count overturned.
-
-**Failsafe:** if the multisig fails to sign within `resolution_deadline_unix + 7 days`, ANY user can call the existing `ResolvePermissionless` (tag 29), which settles at the matcher's current `p_yes_e6` time-weighted EWMA (configured for prediction markets to use a 24h-equivalent half-life via the existing `mark_ewma_halflife_slots` infrastructure). Worse than a correct resolution, but better than indefinite limbo.
-
-### 5.2 V2 — hybrid resolver model
-
-Five candidates evaluated:
-
-| Candidate | Pro | Con | V2 verdict |
-|---|---|---|---|
-| **Pyth** | Already integrated; zero-trust for hard-data markets | Only covers price/data feeds — useless for elections, sports | **Auto-resolve for price-conditional markets only** |
-| **UMA Optimistic Oracle** | Battle-tested at Polymarket; 2h challenge / 4-6d escalation | Solana-side adapter doesn't exist; ~4-6 weeks senior eng + audit | **High-TVL markets (>$50k), opt-in** |
-| **Reality.eth / Augur-style** | Permissionless, fully on-chain | No mature Solana port | Skip; revisit V3 |
-| Internal team multisig | Fast, controlled | Doesn't scale | V1 only |
-| **Per-market designated resolver + Council appeal** | Permissionless, flexible, lets creators bring their own trust | New mechanism; needs careful dispute economics | **Primary V2 path** |
-
-**Recommended V2 architecture:** at launch, creator picks a `resolver_mode`:
-
-- `pyth` (free, auto, data markets only — UI gates by category)
-- `creator-attested` (creator self-resolves, 0.5 SOL extra resolver-bond, default for sub-$10k TVL)
-- `uma` (UMA-style, $750-equivalent proposer bond, opt-in for markets with TVL > threshold)
-- `council` (Percolator Council 3-of-5 resolves, 0.25 SOL surcharge — strongest trust signal)
-
-**All paths share dispute escalation:** any disputed resolution lands at the Percolator Council. UMA-path disputes additionally escalate to UMA token-holder vote per Polymarket's flow.
-
-The resolver mode appears as a badge on every market card (`Pyth-verified`, `Creator-attested`, `UMA-secured`, `Council-resolved`). Traders self-select toward markets they trust.
-
-### 5.3 Dispute mechanics
-
-**Window:** 48 hours after `ResolvePredictionMarket` (`config.dispute_window_slots ≈ 432_000` slots at 400ms/slot).
-
-**V1 dispute flow:**
-1. User holds a non-zero position in the market at time of dispute.
-2. User posts a **0.5 SOL bond** to a `DisputeBond` PDA.
-3. User signs `DisputeResolution` (tag 37), flipping the slab to `DISPUTED`.
-4. Resolution Council (3-of-5 multisig — three Percolator team, two external Solana figures published in docs) reviews within 72h.
-5. Council signs `ResolveDispute`:
-   - If original outcome confirmed → disputer loses bond to insurance fund.
-   - If overturned → disputer gets bond back + 50% of treasury reward (0.25 SOL). Original resolver is publicly logged.
-
-**Resolver auto-rotation triggers (audit safeguard).** Any of the following freezes new market assignment to the offending `resolution_oracle` pubkey and forces Council review:
-- **3 INVALID resolutions** in a rolling 90-day window
-- **≥15% INVALID rate** over the last 20 resolutions (minimum sample size 5)
-- **3 overturned disputes** in 90 days
-
-Metrics live in the indexer's `resolver_rate_view` (§8.2); a daily on-chain attestation PDA carries the current "frozen-resolvers" set so the freeze is enforceable program-side at `ResolvePredictionMarket` entry, not just by social pressure. Council retains discretion on reinstatement — auto-freeze is not auto-removal, so honest catastrophic-news clusters (e.g. a sports-postponement wave) get reviewed rather than punished.
-
-**V2 dispute UX:** bond scales with market TVL (`max(0.5 SOL, 0.1% of TVL)`). Routes to UMA Optimistic Oracle for UMA-mode markets.
-
-**INVALID-mode auto-ratification (audit safeguard).** Unlike YES/NO resolutions, `outcome == 3` (INVALID) does NOT finalize immediately. The wrapper's `ResolvePredictionMarket` handler (§2.5) transitions the slab to `RATIFYING_INVALID` and arms a hard **48-hour timer**. During the ratification window:
-
-- Any wallet holding a non-zero historical position may file a dispute with **zero bond**. INVALID is the lazy-resolver escape hatch and must be the hardest path, not the easiest.
-- The Council reviews any dispute within 72h. If upheld → resolution reverts (bond slash and fee redirect reverse, slab returns to `LIVE`, resolver is publicly logged on `/predictions/resolutions`). If rejected → window continues.
-- After `ratification_deadline_unix` passes without an upheld dispute, anyone may permissionlessly crank `ResolveInvalidFinalize` (tag 39) to fire `resolve_market_refund_not_atomic` (§2.6) and unlock trader claims.
-- The creator-bond partial slash (20%, §7.2) and protocol-fee redirect (§7.1) happen at the INVALID-proposal moment, so the finalize tx is non-financial; the financial commitment lands when the resolver signs, with the window providing time-based finality protection rather than fund-protection.
-
-This mirrors UMA's optimistic-oracle pattern (hard time-based finality on every proposal regardless of dispute count) for the specific subset of resolution modes that carry the highest exploit risk.
-
----
-
-## Section 6 — User journeys
-
-### 6.1 V1 admin launching a market
-
-Audience: Percolator core team (3-5 internal wallets behind a multisig). Route: `/admin/predictions/new` (gated by `isAdmin(connectedWallet)`; non-admins 404).
-
-**Wizard steps:**
-
-1. **Question.** `question` (max 140 chars), `short_slug` (auto-suggested), `category` (Politics/Crypto/Sports/Tech/Macro/Culture), `cover_image` (1200×630).
-
-2. **Outcome shape.** Binary YES/NO only in V1. Multi-outcome disabled with "Coming V1.1" tooltip.
-
-3. **Resolution.**
-   - `resolution_source` (URL, shown verbatim on market page).
-   - `resolution_criteria` (long-form, max 1000 chars). The exact rule deciding YES vs NO. **This is the contract with traders.**
-   - `resolution_timestamp` (datetime UTC). Hard-blocks `ResolvePredictionMarket` until this slot.
-   - `resolution_grace_window_hours` (default 72). Past this without resolution → emergency unwind eligible.
-
-4. **Engine.**
-   - Slab tier: medium (1024 slots) default. V12_17 layout for V1.
-   - `trading_fee_bps` (default 50 = 0.50%). Slider 10-200.
-   - Collateral: USDC only in V1.
-   - Matcher: `PredictionAMM-v1` locked.
-   - LMSR `b`: defaults from category (e.g., 10k USDC for elections, 5k for crypto, 2k for niche).
-
-5. **Fee split.**
-   - Creator wallet: prefilled with treasury multisig (editable for V2-style flows).
-   - V1 default: Protocol 70 / LP 30. (V2 default: Protocol 30 / Creator 40 / LP 30.)
-   - Hard min on LP: 15%.
-
-6. **Review & Sign.**
-   - Full diff view, edit affordance per row.
-   - Soft AI lint on `resolution_criteria` (does it contain a date? URL? clear binary phrasing? — flag, don't block).
-   - **Two-signature requirement:** launch tx wraps in Squads multisig proposal. **No single admin can launch unilaterally.**
-
-7. **Post-launch.** Market appears in `/markets?type=predictions`, `/admin/predictions` queue with state `LIVE`. Internal Slack alert in `#predictions-ops`.
-
-### 6.2 V2 anonymous user launching a market
-
-Lives at `/create` (existing wizard) with a top toggle: `Perp | Prediction`.
-
-**Differences from V1:**
-- **Deposit: 5 SOL** at launch, sent to `CreatorBond` PDA.
-- **Designated resolver** — mandatory field. Creator picks (a) Pyth (auto, data-only), (b) creator-attested (0.5 SOL extra resolver-bond), (c) UMA (with proposer-bond), or (d) Percolator Council (0.25 SOL surcharge).
-- **Resolution SLA:** hard-coded 96 hours after `resolution_timestamp`. Miss it → emergency unwind, 50% creator bond forfeited to insurance.
-- **No admin review gate** (permissionless).
-- **6-hour cooling pool** between launch tx confirm and the market appearing in default `/markets` listings. During cooling, reachable only via direct link. Anyone can `Report` it; a flag from the team multisig hides it from default listings permanently (the market still trades — we can't halt it — but it's de-listed). Soft moderation that survives the permissionless promise.
-
-### 6.3 Trader betting on YES/NO
-
-1. Lands on `/p/<slug>` (from Twitter/Discord OG card) or `/markets?type=predictions`.
-2. Sees market detail page. YES at $0.62, NO at $0.38 (always sum to $1.00 minus AMM spread).
-3. Clicks `Buy YES`. Right-rail opens order ticket:
-   - **Amount** (USDC). Quick chips: $10 / $50 / $100 / Max.
-   - **Shares received** (live from LMSR curve). $50 USDC → 80.6 YES shares.
-   - **Avg price** ($0.620 → $0.621 after slippage).
-   - **Max payout** at resolution ($80.60 if YES wins).
-   - **Slippage tolerance:** chip selector 0.1% / 0.5% / 1% / custom. Default 0.5%.
-   - **Explicit confirm panel:** *"If YES wins, you receive $80.60. If NO wins, you receive $0.00. Resolution Dec 31, 2026."*
-4. Signs. Tx flows through existing `TradeCpi` (tag 10) → `percolator-match-pred` matcher → engine updates user position.
-5. Position panel updates: `YES 80.60 shares · Cost $50.00 · Mark $0.621 · Unrealized +$0.04`.
-
-### 6.4 Settlement & claim
-
-**Notifications (user opts in at first-trade):**
-- In-app: persistent banner on `/portfolio` once market enters `RESOLVING`. Clears on claim click.
-- Email (if user added one in `/settings`): one mail at `RESOLVING`, one at `RESOLVED`.
-- Discord webhook (user pastes personal webhook in `/settings`): ops bot pings.
-
-**Claim flow:** after `ResolvePredictionMarket` lands and dispute window passes, position panel becomes single `Claim $80.60` button. One tx → existing `ForceCloseResolved` (tag 30). If user never claims, after 30 days admin can call `AdminForceCloseAccount` and funds sweep to user's wallet automatically.
-
-### 6.5 Market lifecycle states (UI)
-
-- `LIVE` — normal trading.
-- `LOCKED` — last 60 minutes before `resolution_timestamp`; no new positions, position close still permitted. Banner: *"Trading closes in 47:02. Resolution at 2026-12-31 12:00 UTC."*
-- `RESOLVING` — after `ResolvePredictionMarket` signed with outcome YES or NO, dispute window open. Green banner: *"This market resolved YES. Disputes open until 2026-01-02 12:00 UTC. [Dispute]"*
-- `RATIFYING_INVALID` — after `ResolvePredictionMarket` signed with outcome 3 (INVALID), 48h auto-ratification window open. **Amber banner** (higher-friction visual treatment than `RESOLVING`): *"This market has been proposed INVALID by the resolver. Ratification window closes 2026-01-02 14:00 UTC. Dispute for free during this window. [Dispute]"* The free-dispute affordance is the key UX distinction — no bond required, just an open position.
-- `RESOLVED` — terminal. `Claim` buttons. For YES/NO: *"Resolved YES on 2026-12-31 by 0xAB...CD. Source: [link]. [View on Solscan]"* For INVALID-finalized: *"This market resolved INVALID and was refunded. Trader collateral preserved; protocol fees returned via insurance fund (§7.1)."*
-- `UNWOUND` — emergency path. Red banner: *"This market failed to resolve and was unwound at mid-price. [Read the postmortem]"*
-
----
-
-## Section 7 — Fee economics & creator incentives
-
-### 7.1 Fee model
-
-Total taken at trade time is `config.trading_fee_bps` (default 50 = 0.50%). Split is configurable per-market within bounds:
-
-| Recipient | V1 default | V2 default | Hard min | Hard max |
-|---|---|---|---|---|
-| Protocol treasury | 70% | 30% | 25% | 70% |
-| Market creator | 0% (= treasury) | 40% | 10% | 50% |
-| LP | 30% | 30% | 15% | 60% |
-
-**V1 rationale:** creator = treasury, so we don't carve out a "creator" share. Cleaner accounting. **V2 rationale:** tilt toward creators (40%) and LPs (30%) to bootstrap external creator interest and liquidity. Hard-min LP (15%) prevents attacker creator from zeroing LP cut.
-
-The on-chain mechanism is a small **fee-router PDA** on top of the existing trading-fee path. (Implementation note: extend the existing `trading_fee_bps` distribution logic to support a 3-way split via additional config fields.)
-
-**INVALID-mode fee treatment (audit safeguard).** On `outcome == 3` (INVALID) proposal, the protocol-treasury share of accumulated `trading_fee_bps` collected over the market's life is redirected to the slab's `insurance_fund.balance` at the moment the resolver signs `ResolvePredictionMarket` (§2.5). LP and creator fee shares are NOT clawed back — LPs provided continuous LMSR liquidity service and bore locked-capital risk; V2 creators are already partial-slashed (20%) per §7.2. Because `force_close_resolved_not_atomic` already debits the insurance fund proportionally when LP collateral is short, refunded traders receive their pro-rata share of the redirected protocol fees through the existing terminal-close claim path — zero new on-chain accumulator, zero new claim instruction. This matches the Polymarket convention (collateral returned, fees kept by LPs) while adding a "we failed you" signal from the protocol's own fee cut.
-
-### 7.2 V2 launch deposit: 5 SOL
-
-**Recommended: 5 SOL** (~$1000 at recent prices).
-
-Justification:
-- Polymarket has ~$0 friction but a centralized whitelist. Augur was ~$50 + REP, too low. Kalshi requires CFTC sponsorship, too high.
-- $1000 deters trivial spam without locking out a serious indie creator.
-- Slashing economics (below) require enough principal to be meaningful.
-
-**Slashing rules:**
-
-| Scenario | Bond outcome | LP outcome | Trader outcome |
-|---|---|---|---|
-| Clean YES/NO resolution, no dispute | Full refund after 7d | Claim normally | Claim normally |
-| INVALID resolution (outcome=3), ratification window expires without upheld dispute | **20% slash to insurance**, 80% returned after 7d | Position detached at entry (§2.6); claim collateral normally; LP fee share retained | Position detached at entry; pro-rata share of redirected protocol fees received through existing claim path |
-| Resolution within SLA, dispute overturned | 50% slash to insurance, 50% to disputers | Re-settled per overturned outcome | Re-settled |
-| Missed SLA (no resolution by `deadline + grace`) | 50% slash to insurance, 50% returned | Emergency unwind at mid-price | Emergency unwind at mid-price |
-| Undefined resolution criteria (Council judges meaningless) | Full slash to insurance | Emergency unwind at mid-price | Emergency unwind at mid-price + full fee refund (all three shares) |
-| Market never traded by `resolution_timestamp` | Full refund | n/a | n/a |
-
-The **20% INVALID slash** (audit safeguard) prices the refund branch above zero so creators cannot use it as a free escape when YES/NO becomes unfavorable. Calibrated between Polymarket's effective 0% (INVALID isn't a slash event there) and the "Missed SLA" row's 50% — INVALID is a voluntary and uncontested resolution mode unlike a missed SLA, so the slash is correspondingly smaller. Combined with the 48h auto-ratification window (§5.3), this turns INVALID from a free option into a costly emergency button while leaving room for honest "this event genuinely cannot be adjudicated" calls.
-
-**Soft floor:** creators can stake additional SOL into the bond (visible on the market page as `Creator stake: 10 SOL`) — costly-signal mechanism. No enforced minimum past 5 SOL; we display the stake prominently so traders can self-select toward serious creators.
-
-### 7.3 V2 spam protection beyond the bond
-
-- **Per-wallet rate limit: 1 market per 24 hours**, enforced via creator-account PDA `["pred-creator-cooldown", creator]` storing last creation slot.
-- **Curated resolution oracle allowlist** — even in V2. The set of acceptable `resolution_oracle` pubkeys lives in a protocol DAO config PDA. V2 is "permissionless market creation, curated resolvers."
-- **Minimum collateral mint allowlist** — only USDC + a handful of approved stablecoins. Don't let creators denominate a 6-month presidential market in a memecoin.
-
----
-
-## Section 8 — Off-chain / backend changes
-
-### 8.1 Keeper
-
-Two new service files (`percolator-keeper/src/services/`):
-
-- **`predictionResolution.ts`** — polls every active prediction market every `RESOLUTION_POLL_INTERVAL_MS` (15s). For each market with `clock.unix_timestamp >= resolution_deadline_unix` AND `resolution_outcome == 0`, calls the V1 multisig endpoint or (V2) the resolution oracle's webhook. When multisig signs, submits `ResolvePredictionMarket`.
-
-- **`predictionSettle.ts`** — on observing a `ResolvePredictionMarket` event (via indexer or program-log subscription), schedules a `ForceCloseResolved` crank at `resolved_slot + force_close_delay_slots + 1`. Walks all populated `user_idx` slots from the slab's accounts bitmap. Each `ForceCloseResolved` is ~40k CU; batch 4-8 per tx.
-
-The existing crank loop (`crank.ts`) requires no changes — `KeeperCrank` itself is unchanged for prediction markets.
-
-### 8.2 Indexer
-
-New file: **`PredictionIndexer.ts`**. Subscribes to `percolator-prog` logs filtering for tag 36 (`ResolvePredictionMarket`) and tag 37 (`DisputeResolution`). Writes to two new Supabase tables:
-
-```sql
--- prediction_resolutions
-slab_pubkey       TEXT PRIMARY KEY
-market_title      TEXT
-outcome           SMALLINT   -- 1=NO, 2=YES, 3=INVALID
-resolved_at_slot  BIGINT
-resolved_at_unix  BIGINT
-resolver_pubkey   TEXT
-settlement_tx     TEXT
-dispute_count     INT DEFAULT 0
-
--- prediction_disputes
-id                BIGSERIAL PRIMARY KEY
-slab_pubkey       TEXT
-disputer_pubkey   TEXT
-reason_hash       TEXT       -- IPFS pin or similar
-filed_at_slot     BIGINT
-status            TEXT       -- 'open' | 'upheld' | 'rejected'
-```
-
-The existing `TradeIndexer.ts` continues to capture all trades — prediction-market trades come through the same `TradeCpi` path.
-
-**Resolver-rate view (audit safeguard for §5.3 auto-rotation triggers).** New materialized view `resolver_rate_view` over `prediction_resolutions`, aggregated per `resolver_pubkey`:
-
-| Column | Source |
-|---|---|
-| `resolver_pubkey` | `prediction_resolutions.resolver_pubkey` (group key) |
-| `total_resolutions` | count of rows |
-| `invalid_count` | count where `outcome = 3` |
-| `overturned_count` | join `prediction_disputes` where `status = 'upheld'` |
-| `invalid_rate_lifetime` | `invalid_count / total_resolutions` |
-| `invalid_rate_last_20` | rolling window over the most-recent 20 resolutions |
-| `last_invalid_at_unix` | max `resolved_at_unix` where `outcome = 3` |
-| `invalid_count_90d` | count where `outcome = 3 AND resolved_at_unix >= now - 90d` |
-
-Refreshed on every `prediction_resolutions` insert. Exposed at `/api/prediction/resolvers/[pubkey]` and on the `/admin/resolvers` dashboard. A separate **frozen-resolvers attestation PDA** (`["pred-frozen-resolvers"]`) mirrors the "should freeze" boolean per pubkey for the auto-rotation triggers; the keeper updates this attestation daily from the view, and `ResolvePredictionMarket` (§2.5) reads it via `require_resolver_not_frozen`.
-
-### 8.3 API (Next.js `app/app/api/`)
-
-New routes:
-
-- **`prediction/markets/route.ts`** — `GET` list, filters: `active | resolving | resolved`.
-- **`prediction/markets/[slab]/route.ts`** — `GET` detail. Returns market metadata + current `q_yes_e6`/`q_no_e6`/`p_yes_e6` from matcher context + resolution state.
-- **`prediction/markets/[slab]/positions/[wallet]/route.ts`** — `GET` user position.
-- **`prediction/dispute/route.ts`** (V2) — `POST`. Submits a dispute tx, takes reason text + IPFS upload, returns `dispute_id`.
-
-### 8.4 Frontend (`app/`)
-
-**New page tree:**
-- `predict/page.tsx` — index of active prediction markets.
-- `predict/[slab]/page.tsx` — detail / trade page.
-- `predict/resolved/page.tsx` — settled-market history.
-- `p/[slug]/page.tsx` — short-URL redirector with dynamic OG card.
-
-**New hooks (`app/hooks/`):**
-- `usePredictionMarket(slab: string)` — wraps `GET /api/prediction/markets/[slab]`.
-- `usePredictionPosition(slab, wallet)` — user-side state + unrealized PnL at current `p_yes_e6`.
-- `useResolution(slab)` — subscribes to resolution events via Supabase realtime.
-- `useDispute(slab)` (V2) — dispute flow.
-
-**New components (`app/components/predict/`):**
-- `PredictionBetPanel.tsx` — YES/NO toggle + amount + slippage chip.
-- `ResolutionBanner.tsx` — yellow during dispute window, green on settlement, red on INVALID.
-- `OutcomeChart.tsx` — historical `p_yes_e6` time series.
-- `ResolutionRiskPanel.tsx` — collapsible panel showing source, criteria, resolver badge, dispute mechanics. **Above the order ticket on first scroll on mobile.** Trader must scroll past resolution disclosure to bet.
-
-The existing `TradeCpi`-based wallet code doesn't need to know about prediction markets specifically. The wallet just sets `lp_idx` to the prediction matcher's LP slot and submits — same instruction.
-
----
-
-## Section 9 — Reuse vs new (concrete table)
-
-| Component | Reused as-is | Reused with changes | New |
-|---|:-:|:-:|:-:|
-| `SlabHeader` struct | ✓ | | |
-| `MarketConfig` struct | | ✓ (append 64-byte tail, bump version V12→V13) | |
-| Slab tier sizes | ✓ | | |
-| Matcher CPI ABI (`MatcherCall`/`MatcherReturn`) | ✓ | | |
-| Matcher binary | | | ✓ `percolator-match-pred` (LMSR) |
-| `TradeCpi` (tag 10) | ✓ (one ~30-line carve-out for `market_kind ≥ 1`) | | |
-| `KeeperCrank` (tag 5) | ✓ | | |
-| `ResolveMarket` (tag 19) | ✓ (admin-resolved markets only) | | |
-| `ResolvePermissionless` (tag 29) | ✓ (failsafe path for both) | | |
-| `ForceCloseResolved` (tag 30) | ✓ ("SettlePosition" semantics) | | |
-| `ResolvePredictionMarket` (tag 36) | | | ✓ |
-| `InitPredictionMarket` (tag 35, V2) | | | ✓ |
-| `DisputeResolution` (tag 37, V2) | | | ✓ |
-| `ClaimBond` (tag 38, V2) | | | ✓ |
-| Insurance fund (`percolator-stake`) | ✓ | | |
-| Engine `resolve_market_not_atomic` | ✓ (called with `funding_rate = 0`) | | |
-| Engine `resolve_market_refund_not_atomic` + per-account helper | | | ✓ (for INVALID; see §2.6 for the helper-plus-iterator shape and the sizing note) |
-| Engine `force_close_resolved_with_fee_not_atomic` | ✓ | | |
-| Risk engine funding loop | ✓ (no-op when `funding_k_bps = 0`) | | |
-| Risk engine liquidation | ✓ (different margin params) | | |
-| Keeper crank loop | ✓ | | |
-| Keeper resolution service | | | ✓ `predictionResolution.ts` |
-| Keeper settlement service | | | ✓ `predictionSettle.ts` |
-| Indexer trade ingestion | ✓ | | |
-| Indexer resolution table | | | ✓ |
-| Existing perp UI | ✓ | | |
-| Prediction market UI | | | ✓ `predict/*`, `p/[slug]` |
-| SDK | | ✓ (semver major bump) | |
-
-**The "reused" column dominates.** The single most important architectural finding from this design exercise: prediction markets on Percolator are mostly a configuration + matcher-swap + thin shim, not a parallel program.
-
----
-
-## Section 10 — Migration & backwards compatibility
-
-### 10.1 Discriminating prediction vs. perp
-
-`config.market_kind: u8`. Existing slabs have zero-filled reserved bytes; `market_kind == 0` reads as "Perp" and matches legacy behavior. **No migration needed for live perp markets.**
-
-### 10.2 Slab version bump
-
-`SlabHeader::version` goes from 12 to 13. Existing markets keep their old version; new prediction markets deploy at V13. Wrapper handlers do `match version { 0..=12 => legacy_layout, 13 => v13_layout }` for any field that moved. Since we only *append* to `MarketConfig`, legacy reads are forward-safe.
-
-### 10.3 SDK versioning
-
-Adding new tags requires an SDK major bump. Current is `@percolatorct/sdk` 2.x. Ship 3.0.0 with:
-- All existing tag builders.
-- New: `instructions.resolvePredictionMarket`, `instructions.initPredictionMarket`, `instructions.disputeResolution`, `instructions.claimBond`.
-- New: `accounts.parseMarketConfigV13` (decodes appended fields).
-- Old SDK methods continue working against perp markets; prediction calls are net-new.
-
-### 10.4 Slab tier sizing
-
-V1 prediction markets don't need 4096 user slots. Each user is in ONE slot (their open position); `max_accounts` caps concurrent open positions, not unique participants over the market's lifetime.
-
-**Recommendation:** ship V1 at the existing **V12_17 layout (1024 slots ≈ 256 KB)** — plenty for typical political markets, matches an existing audited tier. Introduce a smaller V13_S tier (256 slots ≈ 64 KB) later if rent becomes a concern for niche markets.
-
----
-
-## Section 11 — Risks & testing
-
-### 11.1 Risks the existing engine doesn't catch
-
-1. **Matcher misbehavior at boundary prices.** LMSR fixed-point math has bounded error (~2 e6-units), but if `p_e6` rounds to exactly 0 or 1_000_000 during a trade, the band check divides by `price` and degenerates. **Mitigation:** clamp matcher output to `[1, 999_999]` always — never 0, never 1_000_000 — until *after* resolution. Engine treats 999_999 as "essentially YES."
-
-2. **Resolution-time slippage.** When `ResolvePredictionMarket` sets `resolved_price = 1_000_000`, every existing position has an entry far below. A user who bought YES at `p = 0.01` and won gets a 99x payout. **Insurance fund must be sized accordingly.** Track maximum-loss-per-LP-at-resolution as a separate metric; force LPs to top up if inventory implies underfunded payout.
-
-3. **`config.resolution_oracle` key compromise.** Worse than admin compromise on a perp because attacker can settle YES at NO and drain LPs. **Mitigation:** require resolution oracle to be a Squads multisig PDA, validated at `InitPredictionMarket` time. V2 alternative: UMA optimistic oracle has its own dispute and slashing built in.
-
-### 11.2 Worst exploit scenarios specific to prediction markets
-
-1. **Frontrun resolution.** Trader with non-public knowledge of outcome trades large size in the last hour. **Mitigation:** at `resolution_open_unix - 1 hour`, matcher widens spreads dramatically (configurable; default 5× baseline) AND admin can call a `PauseTrading` instruction (tag 41, new — minor addition) to freeze the matcher. Same mechanic Polymarket uses ("market closes 1 hour before resolution").
-
-2. **Last-trade manipulation.** Trader pumps `p_yes_e6` to 0.99 in the final block before `ResolvePermissionless` fires (multisig unavailable), then settles at the manipulated price. **Mitigation:** for `market_kind == 1`, `ResolvePermissionless` settles at the **time-weighted EWMA** of `p_yes_e6` over the last 24 hours, using the existing `mark_ewma_e6` infrastructure.
-
-3. **Junior tranche LP rage-quit during volatile resolution.** Junior LPs see `p_yes_e6` swing wildly pre-resolution and try to unstake before being slashed. **Mitigation:** extend junior tranche withdrawal cooldown to span `[market_close, resolved_slot + force_close_delay_slots]`.
-
-### 11.3 Testing strategy
-
-1. **Unit / Kani proofs** — extend `percolator/tests/proofs_*.rs` with prediction-market invariants:
-   - *"If `market_kind == 1`, `resolved_price ∈ {1, 1_000_000} ∪ sentinel`"*
-   - *"Sum of payouts at settlement ≤ sum of collateral deposited"*
-   - *"After `ResolvePredictionMarket`, no further trades can land"*
-
-2. **Devnet markets** — launch 3 devnet prediction markets at varying liquidity (`b = 1k, 10k, 100k`); team manually trades through full lifecycles including: clean resolution, disputed resolution, INVALID resolution, multisig-stuck-then-permissionless resolution. **Two weeks minimum on devnet before mainnet.**
-
-3. **Simulated resolutions** — write `scripts/simulate-prediction-resolution.ts` that initializes a market, generates 1000 random trades, freezes the matcher, calls `ResolvePredictionMarket`, walks `ForceCloseResolved` for every slot, verifies sum-of-payouts identity. Run as a CI job.
-
-4. **Third-party audit** — scope is small (~1300 lines net new). **Target 4 weeks with one senior auditor** (Halborn or OtterSec). Cost: $50-80k. Critical because resolution authority can drain LPs if compromised.
-
----
-
-## Section 12 — Phasing & rollout plan
-
-### 12.1 V1 launch slate (recommend 4 markets)
-
-**Hard rule: no US-election markets in V1 slate.** Regulatory and reputational risk asymmetric. Grow into that category in V1.2 after building resolution muscle memory.
-
-| # | Market | Resolution path | Why |
-|---|---|---|---|
-| 1 | *"Will SOL close above $300 on Dec 31, 2026 UTC?"* | Pyth-resolvable | Our ecosystem, low-controversy, trust-building flagship |
-| 2 | *"Will Solana surpass Ethereum in 7-day DEX volume in any week of 2026?"* | Council-resolved (DefiLlama-sourced) | Tests Council muscle on friendly category |
-| 3 | *"Will FIFA World Cup 2026 final be won by a CONCACAF nation?"* | External-canonical (FIFA) | Broad appeal, clean resolution, ends June 2026 — fast first lifecycle |
-| 4 | *"Will Anthropic/OpenAI/Google release a model scoring >90% on SWE-Bench Verified before Dec 31, 2026?"* | Council-resolved | Crypto-adjacent tech market, our exact audience |
-
-Three resolution categories, one fast-ending market for early dogfooding. Opening insurance commitment: $50k from treasury across all four.
-
-### 12.2 V1 minimum-viable feature set
-
-**Must-ship:**
-- `/markets` with Perps/Predictions toggle.
-- `/p/<slug>` with OG card generation.
-- Prediction-flavored trade page.
-- LP modal with lock-until-resolution warning.
-- Admin launch wizard.
-- `ResolvePredictionMarket` integration into `/admin/predictions/<slab>/resolve`.
-- Dispute flow (bond, freeze, Council review).
-- Settlement notifications (in-app banner + email).
-- Resolution & Risk panel on every prediction page.
-- Public resolution ledger at `/predictions/resolutions`.
-
-**Defer to V1.1:**
-- Multi-outcome (3+) markets.
-- SOL-denominated predictions.
-- Discord webhook integration (low effort).
-- Devnet play-money mode.
-
-**Defer to V2:**
-- V2 launch wizard with bond escrow.
-- Resolver-mode selector.
-- UMA integration path.
-- 6h cooling pool + reporting flow.
-- Per-market resolver badges.
-
-### 12.3 V2 gate criteria
-
-Flip to permissionless **only when all of these hold for ≥30 consecutive days**:
-
-- ≥ 15 markets resolved cleanly (no disputes overturned).
-- ≥ $500k cumulative prediction volume.
-- ≥ 200 unique trader wallets across prediction markets.
-- Insurance fund senior tranche ≥ $250k.
-- Zero unresolved Sentry P0/P1 errors in predictions path for 14 days.
-- Council postmortem cadence holding (every disputed market gets a published postmortem within 7d).
-
-Publish a public `/predictions/readiness` dashboard tracking each metric. Holds us accountable and gives the community a yardstick.
-
-### 12.4 Operational responsibilities
-
-| Role | Owner | SLA |
-|---|---|---|
-| Admin launch queue review | PM rotation, weekly | 24h |
-| Resolution execution | On-call eng + PM (paired) | Within 24h of `resolution_timestamp` |
-| Dispute first response | Council on-call | Ack within 12h, decide within 72h |
-| Postmortem authorship | PM on the dispute | Published within 7d |
-| Resolver oracle health (Pyth feeds) | Keeper team | Existing on-call rotation |
-| Community comms during disputes | PM + Marketing | Status page within 2h |
-
-**The Council (3-of-5 multisig) needs naming and external members chosen *before* V1 launch.** Recommend: 2 external members — one Solana Foundation-adjacent, one prediction-market-native (ex-Polymarket / Augur). Compensation: nominal monthly retainer + per-dispute fee from treasury.
-
----
-
-## Section 13 — Open questions for team alignment
-
-1. **Legal / geofencing.** Do we geofence US users for V1? Polymarket geofences; Kalshi is CFTC-regulated. We're permissionless, but a US user trading a US election market on our site is a real risk vector. **Need counsel input before market #1 ships.**
-
-2. **Council external seats.** Who are the two non-team Council members? Need names + commitment before launch. Suggest reaching out to Solana Foundation and ex-Polymarket eng/PM.
-
-3. **Insurance fund segregation.** Should the predictions insurance be a separate tranche from perps, or shared? Shared = simpler + more capital efficient. Separate = blast radius contained. **Recommend separate tranche, shared LP UI** — engineering effort modest, blast radius worth it.
-
-4. **Play-money / devnet mode.** Manifold's growth was driven by play-money onboarding. We already have `/devnet-mint`. **Recommend yes, V1.1.**
-
-5. **Resolution timezone defaults.** UTC always, but wizard should add a "localization preview" widget. Low effort, high error-reduction.
-
-6. **Mobile order ticket density.** Order ticket on mobile needs a bottom sheet — but the Resolution & Risk panel needs to remain pre-trade-visible. **Conflict — needs design sprint.**
-
-7. **Cross-market portfolio risk.** A trader holding $5k of YES on four correlated election markets is concentrated. Do we surface portfolio-level correlation warnings? Out of V1 scope; flag for V1.2.
-
-8. **Naming.** "Percolator Predictions" vs "Percolator Events" vs no sub-brand. **PM recommendation: no sub-brand, just product-type tabs.** Marketing has a vote.
-
-9. **OG image rendering cost.** Dynamic OG on Vercel can add latency/cost. Pre-generate at launch time and CDN-cache? Engineering call.
-
-10. **Resolution criteria template library.** Ship 5-10 pre-vetted criteria templates ("price-at-time," "binary-event-by-date," "majority-vote-outcome") to reduce ambiguous criteria? **Strongly recommend yes for V1 admin wizard; near-required for V2** to keep "criteria meaningless" rejection rate manageable.
-
-11. **UMA Solana-side adapter build.** 4-6 weeks senior engineering + audit. **Greenlight in parallel with V1 implementation** so V2 isn't blocked when the gate criteria hit?
-
-12. **`config.dex_pool` field correction.** Engineering noted my initial brief mentioned this field as already existing — production wrapper does not have it. The hyperp mode pushes prices via `hyperp_authority` rather than reading an on-chain DEX pool. **Action: update internal docs.**
-
----
-
-## Section 14 — Estimated effort & timeline
-
-| Workstream | Effort | Notes |
-|---|---|---|
-| `percolator-prog` wrapper: `ResolvePredictionMarket` + `ResolveInvalidFinalize` (tag 39) + resolver-position prohibition + frozen-resolver gate + 20% bond slash + protocol-fee redirect + V13 layout + band carve-out | 3-4 weeks senior eng | Includes Kani proof updates and the audit-safeguard wrapper logic for INVALID ratification (§2.5, §5.3, §7.1, §7.2) |
-| `percolator` engine: `resolve_market_refund_not_atomic` + per-account detach helper | 2-3 weeks senior eng | ~300–500 lines including the Kani harness in `tests/proofs_prediction.rs`; see §2.6 for the design split |
-| `percolator-match-pred` LMSR binary | 3-4 weeks senior eng | Fixed-point log/exp + Remez approximations are the hard part |
-| `percolator-keeper`: `predictionResolution` + `predictionSettle` services | 2 weeks | TS, mostly straightforward |
-| `percolator-indexer`: `PredictionIndexer` + migrations | 1 week | TS + Supabase migration |
-| `percolator-launch` API routes | 1 week | Next.js route handlers |
-| `percolator-launch` frontend (`predict/*`, components, hooks) | 4-5 weeks | Bulk of UX work |
-| `percolator-launch` admin wizard | 2 weeks | Multi-step form + validation |
-| SDK 3.0 release | 1 week | New instruction builders + V13 parsers |
-| Third-party audit | 4 weeks | Single senior auditor; can overlap final 2 weeks of build |
-| Devnet trial period | 2 weeks | Hard gate before mainnet |
-
-**Total: ~16-18 weeks (4 months) from kickoff to V1 mainnet launch**, assuming 2 senior engineers + 1 frontend engineer + 1 PM + audit in parallel. **V2 permissionless adds ~6-8 weeks** for `InitPredictionMarket`, `DisputeResolution`, `ClaimBond` + UMA Solana-side adapter (the latter is the long pole). A follow-on **V3 product extension** — leveraged perps on prediction-market implied probabilities — is specified in Section 15 below as a separate, smaller workstream that does not block V1 or V2.
-
----
-
-## Section 15 — Leveraged Probability Perps (V3 product extension)
-
-### 15.1 Premise
-
-A binary prediction market's `last_p_yes_e6` is an on-chain time series of implied probability between launch and `resolution_open_unix`. Traders want leveraged exposure to *the path that probability takes* — debate gaffes, polling shocks, news cycles, last-minute goals — not just the terminal `{0, 1}` payoff. A perpetual future whose oracle equals the time-weighted underlying mid is the cleanest expression of that demand.
-
-Hard product cap: **5x leverage.** Non-negotiable, set by lead developer. Rationale: a single 20% probability move (on-distribution for real prediction markets) wipes a 5x position; higher leverage adds tail-risk without product value, and the bounded-domain math (§15.5) means worst-case loss is fixed in closed form rather than stochastic.
-
-Greenlight contingent on V1/V2 prediction-market launch holding for ≥60 days with no resolution-pipeline P0/P1 incidents. This section is what we build *after* prediction-spot proves itself in production.
-
-### 15.2 Architecture fit — another `market_kind` variant
-
-This is **`market_kind = 2` (`PerpOnPrediction`)**, NOT a new program, NOT a new matcher binary, NOT a new engine method. The V13 `MarketConfig` tail (§2.2) already discriminates kinds; we extend the enum, no layout bump:
-
-```rust
-//  0 = Perp (legacy), 1 = PredictionBinary, 2 = PerpOnPrediction (V3)
-pub market_kind: u8,
-```
-
-What we reuse, unchanged:
-
-- **Matcher binary:** existing `percolator-match` (oracle-anchored spread quoter, `exec = oracle × (1 ± total_bps/10_000)`). Its design is exactly what we want — the oracle just happens to be a probability instead of a SOL/USD mid.
-- **`TradeCpi` (tag 10)** — same hot path. The `market_kind != 0` band-floor carve-out from §2.4 already widens to 200 bps, which is correct for this product too.
-- **`KeeperCrank` (tag 5)**, `LiquidationPolicy::FullClose`, ADL via `adl_mult_long` / `adl_mult_short`, insurance fund — untouched.
-- **Funding-rate machinery — set to zero, hard-coded**, mirroring §4.1. The perp's matcher quotes off the oracle, so by construction there is no matcher-vs-oracle drift to bleed off. Funding would be a pure leverage tax paid to no useful end. `funding_k_bps = 0`, engine path becomes a no-op.
-
-### 15.3 Oracle adapter — pull, not push
-
-This is the load-bearing new piece. Two options were considered:
-
-**(a) Push-based.** A keeper TWAPs the underlying off-chain and writes into a `hyperp_authority`-style account every N slots.
-**(b) Pull-based.** A new branch in `read_price_and_stamp` reads `BinaryLmsrState.last_p_yes_e6` directly from the underlying slab's matcher-context tail, then time-weights it against a slot-indexed ring buffer stored in the perp's own `MarketConfig` tail.
-
-**Pick (b).** Push adds a trusted keeper to the critical path — an attack surface this protocol has explicitly hardened against in prior security work. Pull keeps the perp's oracle as a deterministic function of on-chain state the user can verify in the same transaction.
-
-Adapter spec (~150 lines in `percolator-prog/src/percolator.rs` alongside `read_price_and_stamp`):
-
-```rust
-fn read_underlying_p_yes_twap_e6(
-    perp_slab: &AccountInfo,        // market_kind == 2
-    underlying_slab: &AccountInfo,  // market_kind == 1, pinned via LinkUnderlying
-    clock: &Clock,
-) -> Result<u64, ProgramError> {
-    // 1. Verify underlying.slab_pubkey matches perp.config.underlying_slab.
-    // 2. Read underlying BinaryLmsrState.last_p_yes_e6 (matcher tail, §3.3).
-    // 3. Append (slot, p_yes_e6) to perp's 150-slot ring buffer (~60s @ 400ms/slot).
-    // 4. Reject if underlying.config.b_e6 < MIN_UNDERLYING_DEPTH_E6 (5_000 USDC).
-    // 5. Reject if underlying state is LOCKED/RESOLVING/RESOLVED — handled by lifecycle (§15.4).
-    // 6. Reject if last write to ring is > STALENESS_WINDOW_SLOTS (30) ago.
-    // 7. Return TWAP, clamped to [10_000, 990_000] e6 (= [1%, 99%]).
-}
-```
-
-Concrete oracle parameters:
-
-| Knob | Value | Rationale |
-|---|---|---|
-| TWAP window | **150 slots (~60s @ 400ms)** | underlying mids move slowly by design; resists single-block manipulation; matches mainstream perp-oracle best practice |
-| Clamp range | **`[10_000, 990_000]` e6** | leverage math diverges below 1% / above 99%; clamp instead of halt |
-| Min underlying depth | **`b_e6 ≥ 5_000_000_000` (5k USDC)** | thin LMSR is cheap to push; reject perp creation otherwise |
-| Staleness window | **30 slots (~12s)** | no underlying trade in 30 slots → `OraclePaused`, halts perp matching |
-| Entry-deviation guard | **`|p₀ − TWAP| / TWAP ≤ 100 bps`** | stale-oracle snipes get rejected at the wrapper |
-| Per-slot move clip | **`max_price_move_bps_per_slot = 2_000`** | tighter than §4.2 spot value (5,000) because the oracle is already TWAP-smoothed |
-
-### 15.4 Lifecycle — the perp inherits the underlying's state machine
-
-The underlying transitions `LIVE → LOCKED → RESOLVING → RESOLVED` (§6.5). The perp tracks:
-
-| Underlying state | Perp behavior |
-|---|---|
-| `LIVE` | Normal trading. Oracle = 150-slot TWAP of underlying `p_yes_e6`. |
-| `LOCKED` (last 60 min before underlying resolution) | Perp halts new positions; close-only. Banner mirrors underlying countdown. Configurable per-market via `perp_locks_with_underlying: bool` (default `true`). |
-| **Pre-resolution perp-only halt** | Perp trading closes **4 hours** before underlying's `resolution_open_unix` — *wider* than the underlying's 60-min lock because perp positions are leveraged and terminal-snap is binary. |
-| `RESOLVING` (underlying YES/NO finalized) | **Terminal-snap force-close.** Keeper calls `ForceCloseResolved` (tag 30) with `resolved_price = underlying.config.resolution_outcome → {1, 1_000_000}` per §2.5. Every open perp position settles at the terminal probability. |
-| `RATIFYING_INVALID` (underlying entered §6.5's 48h INVALID ratification window) | **Perp ALSO halts new positions; close-only.** Cannot terminal-snap yet — the underlying could still revert if the Council upholds a dispute. Banner mirrors underlying's amber "INVALID proposed" treatment. |
-| `RESOLVED` with `outcome = 3` (INVALID, ratification window expired without upheld dispute) | **Perp inherits INVALID.** Keeper detects the `ResolveInvalidFinalize` (tag 39) event on the underlying and calls `resolve_market_refund_not_atomic` (the engine method from §2.6) on every linked perp slab. Open positions detached at zero unrealized PnL, collateral preserved. LP and creator trading fees retained on the perp slab; protocol fees redirected to the perp's own insurance fund (mirrors §7.1 on the perp). **Settlement delay:** perp terminal close fires only after the 48h underlying ratification window expires — there is no terminal-snap on `RATIFYING_INVALID` because the underlying outcome is not yet final. |
-
-The lifecycle hook lives in **`predictionSettle.ts`** (§8.1): for YES/NO finalizations it observes the `ResolvePredictionMarket` event for slab X and queues `ForceCloseResolved` against every linked perp; for INVALID finalizations it observes `ResolveInvalidFinalize` (tag 39) instead, ignoring the earlier `ResolvePredictionMarket` proposal so as not to pre-snap perps before the ratification window closes.
-
-### 15.5 Margin parameters & the bounded-domain insight
-
-Standard perps oracle off an unbounded price. A probability perp oracles off `p ∈ [10_000, 990_000]` e6. Three consequences shape every parameter below.
+Standard perps oracle off an unbounded price. A PerpOnPolymarket oracles off `p ∈ [10_000, 990_000]` e6. Three consequences shape every parameter below.
 
 1. **Worst-case loss per unit is closed-form, not stochastic.** A long opened at entry `p₀` loses at most `p₀` per unit notional (mark → 0). A short opened at `p₀` loses at most `1 − p₀` per unit. The engine integrates max loss exactly across the OI book without statistical tail estimation.
 2. **Margin should be asymmetric near the bounds.** A long at `p = 0.95` has upside 0.05 and downside 0.95 — symmetric `initial_margin_bps` over-funds upside and under-funds downside. We solve this with a leverage-cap shaping function (banded clamp), not a notional tweak, because shaping leverage preserves the existing `initial_margin_bps` field semantics.
-3. **Per-unit-time volatility is bounded.** `p` cannot legitimately move more than 1.0 over the market's entire life. Funding math that assumes log-returns is meaningless; we hard-zero funding (§15.2).
+3. **Per-unit-time volatility is bounded.** `p` cannot legitimately move more than 1.0 over the market's entire life. Funding math that assumes log-returns is meaningless; we hard-zero funding (§4.1).
 
 Base margin params:
 
-| Param | Coin-margined SOL perp | `PerpOnPrediction` |
+| Param | Coin-margined SOL perp | `PerpOnPolymarket` |
 |---|---:|---:|
 | `initial_margin_bps` | 500 (20x) | **2_000 (5x)** |
 | `maintenance_margin_bps` | 250 | **1_300** |
 | `max_price_move_bps_per_slot` | 500 | **2_000** |
-| `max_active_positions_per_side` | matcher LP `b` × 100% | underlying `b` × 20% |
+| `max_active_positions_per_side` | matcher LP `b` × 100% | underlying Polymarket OI × 20% |
 
-The MM ratio (1_300 / 2_000 = 65%) holds the industry-standard ~1.5:1 (Drift, dYdX, Hyperliquid all in this band). Tighter leaves no liquidation buffer; looser wastes margin headroom on a bounded domain.
+The MM ratio (1_300 / 2_000 = 65%) sits in the industry-standard band (Drift, dYdX, Hyperliquid all 1.4-1.6:1).
 
-**Asymmetric overlay — engine-enforced, not UI-restricted.** The UI exposes the 5x slider unconditionally; the engine recomputes the cap from `p₀` at trade time and rejects if the requested leverage exceeds it:
+**Asymmetric overlay — engine-enforced, not UI-restricted.** The UI exposes the 5x slider unconditionally; the engine recomputes the cap from `p₀` at trade time and rejects if requested leverage exceeds it:
 
 ```
 denom = max(p₀, 1 − p₀)
@@ -1003,18 +322,18 @@ elif denom ≤ 0.90:  cap = 2x          # soft asymmetry zone
 else:               reject_open       # outside [0.10, 0.90], no new opens
 ```
 
-Closes are always permitted regardless of `p`. Effective `initial_margin_bps` is `10_000 / cap`, so the 2x band requires 5_000 bps IM and the engine raises `MarginShortfall` if the wallet doesn't post.
+Closes are always permitted regardless of `p`. Effective `initial_margin_bps` is `10_000 / cap`, so the 2x band requires 5_000 bps IM and the engine raises `MarginShortfall` if the wallet does not post.
 
-### 15.6 Liquidation trigger
+### 4.4 Liquidation trigger
 
-Notional must be defined against the domain — not against an unbounded price. We use **side-conditional notional**:
+Side-conditional notional, bounded by the domain:
 
 ```
 notional_long(p)  = position_size × p           # max loss per unit = p
 notional_short(p) = position_size × (1 − p)     # max loss per unit = 1 − p
 ```
 
-Liquidation inequality (per side):
+Liquidation inequality:
 
 ```
 equity < (maintenance_margin_bps / 10_000) × notional_side(p_mark)
@@ -1022,118 +341,364 @@ equity < (maintenance_margin_bps / 10_000) × notional_side(p_mark)
 
 Two clean properties fall out: (a) liquidation price for a long collapses smoothly to 0 (not asymptotically infinite), and (b) maintenance requirement automatically shrinks as the position moves into the money, releasing margin without an explicit reduce-only path.
 
-**Cascade flow — perp slab only.** A 0.40 → 0.20 underlying move triggers:
+### 4.5 Insurance fund sizing
 
-1. Oracle adapter updates the perp's `mark_ewma_e6`; `KeeperCrank` sweeps and flags underwater accounts via the existing `LiquidationPolicy::FullClose` path.
-2. Keeper closes liquidated positions against the **perp's own orderbook** (its spread quoter widens against the move per the standard impact term). No CPI into the prediction matcher.
-3. If perp-side losses exceed LP collateral, engine routes to `engine.insurance_fund.balance` — same path as §2.7.
-4. If insurance hits zero, ADL fires via existing `adl_mult_long` / `adl_mult_short`, socializing loss across winning counterparties proportional to unrealized PnL.
-
-The cascade is contained to the perp slab. The underlying market keeps quoting — its LMSR LPs are not exposed to perp-side insolvency, only to their own `b × ln(2)` bound from §3.2.
-
-### 15.7 Insurance fund sizing
-
-Bounded-domain math collapses the seed formula to closed form. Maximum aggregate loss across the book:
+Bounded-domain math collapses the seed formula to closed form:
 
 ```
 max_aggregate_loss = Σ_longs  (entry_pᵢ × sizeᵢ)
                    + Σ_shorts ((1 − entry_pᵢ) × sizeᵢ)
 ```
 
-With 5x leverage cap, max OI per side ≤ `5 × LP_collateral`. Worst-case `max(entry_p, 1 − entry_p) ≤ 0.90` (entries outside `[0.10, 0.90]` are rejected per §15.5). Seed at:
+With 5x leverage cap, max OI per side ≤ `5 × LP_collateral`. Worst-case entry `max(p, 1 − p) ≤ 0.90` (entries outside `[0.10, 0.90]` are rejected per §4.3). Conservative seed: **`insurance_seed = 1.0 × LP_collateral`** at perp launch.
 
-```
-insurance_seed = 0.10 × 5 × LP_collateral × 0.90 ≈ 0.45 × LP_collateral
-```
+This covers the one-sided-OI worst case (cluster of longs at `p = 0.10` or cluster of shorts at `p = 0.90`) rather than the uniform-distribution expected case. Slightly over-provisioned at launch, which is the correct direction.
 
-Round to **`0.50 × LP_collateral`** at perp launch. This is independent of the underlying prediction market's `b × ln(2)` LP-loss bound (§4.5) — the perp slab carries its own insurance tranche so a perp-side cascade cannot drain prediction-spot LPs.
+---
 
-### 15.8 User experience
+## Section 5 — User journeys
 
-**IA: a third tab, not a new top-level surface.** The leveraged-perp UI lives at `/predict/[slab]/perp`. The market-detail page (`/predict/[slab]`) gets a third tab next to `Buy YES / Buy NO / LP`: **`Leveraged 5x`**.
+### 5.1 V1 team launching a perp
 
-This is correct because the trader's hardest decision is not "which market" — it is "is this a binary bet, or a chart trade?" Forcing that decision onto a single page lets users walk down the conviction gradient without re-routing: spot YES is a 1x bet on the *outcome*; perp YES (1x–5x) is a bet on the *path*. The two share the same resolution-criteria panel, the same hero card, the same `p_yes_e6` feed.
+Audience: Percolator core team. Route: `/admin/predict/new` (gated by `isAdmin(connectedWallet)`).
 
-Trade-page layout:
+**Wizard steps:**
 
-```
-+--------------------------------------------------------------+
-| HERO (reused): "Will Trump win 2028?" · resolves 2028-11-08  |
-| Buy YES  |  Buy NO  |  LP  | [Leveraged 5x] <-- active       |
-+--------------------------------------------------------------+
-|                                              | LONG | SHORT  |
-|   p_yes chart (last 30d, candles)            +---------------+
-|   0.42 ----+                                 | Lev: 1 2 3 5  |
-|            |                                 |       ^ def 2 |
-|   --- liq 0.31 (red dashed) -----------------| Size: $___    |
-|                                              | Mark: 0.420   |
-|                                              | Liq:  0.310   |
-|                                              | Max loss: $50 |
-|                                              | Funding: 0.00%|
-|                                              +---------------+
-|                                              | If you hold   |
-|                                              | to resolution:|
-|                                              | YES -> $238   |
-|                                              | NO  -> $0     |
-|                                              +---------------+
-|                                              | [ Open Long ] |
-+--------------------------------------------------------------+
-| Resolution criteria (reused from spot tab, collapsed)        |
-+--------------------------------------------------------------+
-```
+1. **Pick the Polymarket market.** Search bar accepts Polymarket URLs, short URLs, condition-ids, or natural-language queries. Selected market displays Polymarket question, condition-id, current implied probability, 7-day Polymarket volume, UMA resolution rules (read-only, pulled from Polymarket).
+2. **Oracle source.** Pyth (auto, for price-threshold markets), custom keeper (default for sentiment markets), Switchboard (V2). V1 admin defaults: Pyth where available, custom keeper otherwise.
+3. **Engine parameters.** Slab tier (default: medium, 1024 slots, V13 layout). `trading_fee_bps` (default 50 = 0.50%, slider 10-200). Collateral mint (USDC only in V1).
+4. **Margin parameters.** 5x leverage cap (hard ceiling). Asymmetric clamp parameters at defaults (§4.3).
+5. **Fee split.** V1: Protocol 70 / LP 30 (creator = treasury for team-launched markets). Hard min on LP: 15%.
+6. **Review & sign.** Full diff view, edit affordance per row. Two-signature requirement: launch tx wraps in Squads multisig proposal.
 
-The chart of `p_yes_e6` is the killer feature — for the first time on the platform, **opinion itself is a candle**. The liquidation line draws on the same axis as price; no separate widget. The "If you hold to resolution" panel is non-negotiable: it is the only place the binary snap to 0 or 1 is made concrete in numbers, not prose. On mobile, the right rail becomes a bottom sheet (same pattern as the spot prediction ticket).
+### 5.2 V2 anonymous user launching a perp
 
-**Leverage control.** Discrete chips `1x | 2x | 3x | 5x`. No 4x — the payoff curve does not reward granularity in the middle, and bigger chips read better on mobile. No slider, no numeric input, no "advanced" toggle, no unlock path. 5x is the ceiling, baked into the UI, enforced in the order builder, and re-enforced in the engine. Default **2x**, matching the existing spot prediction cap to create a discoverability gradient. When `p_yes_e6 < 0.10` or `> 0.90`, the chip group gets a red border and a one-line warning: *"Near a bound. Small moves liquidate fast."* We educate at the moment of choice — never hide the option.
+Lives at `/create` with `Perp | Polymarket-perp` toggle (or as a dedicated `/discover` flow).
 
-**First-trade disclosure.** A blocking modal on the first perp trade for any wallet:
+**Differences from V1:**
 
-> **You're trading the chart, not the outcome.**
-> - This is a **leveraged** position (up to 5x).
-> - You can be **liquidated** before the market resolves and lose your margin.
-> - If you hold to resolution, the price **snaps to $0 or $1** against your entry.
+- **Bond: 10 SOL** at launch, sent to a `LauncherBond` PDA. Plus a creator-defined `market_seed_deposit` in USDC (sets the initial LP buffer).
+- **Oracle source picker.** Pyth (auto, free), Switchboard On-Demand (default for sentiment markets, free), custom keeper (creator-multisig signed, requires additional 25 SOL keeper-bond).
+- **Creator fee bps slider.** 0–800 bps (capped at 8% of trading fees). Default 200 bps (2%). The fee splits the existing trading-fee pool — protocol and LP shares are reduced when creator takes more, within hard mins per §6.1.
+- **Permissionless gate at the wrapper.** `LinkPolymarketMarket` checks at tx time: Polymarket market age ≥ 14 days, Polymarket 24h volume ≥ $25k for 7 consecutive days, Polymarket open interest ≥ $50k, max single-LP share ≤ 30% of underlying liquidity. Failing any check rejects the launch.
+- **6-hour cooling pool** before the perp appears in default `/discover` listings. During cooling it's only reachable by direct link. Any flag from the team multisig hides it from defaults permanently (the perp keeps trading; we can't halt it).
+
+### 5.3 Trader leveraging a Polymarket view
+
+1. Lands on `/discover` (browse Polymarket markets with available perps) or follows a direct link.
+2. Sees the trade page. Polymarket question rendered at top with a small "On Polymarket" subtitle and a logomark (muted, monochrome — we own the chrome, Polymarket gets the attribution).
+3. Chart of `p_yes` over time, with the trader's potential liquidation line overlaid as a red dashed horizontal.
+4. Order ticket on the right (mobile: bottom sheet):
+   - Long / Short toggle (probability-side, not YES/NO — this is a perp).
+   - Leverage chips `1x | 2x | 3x | 5x` (no 4x; bigger chip targets; default 2x).
+   - Size in USDC.
+   - Live readouts: mark, liquidation price, max loss, funding (currently 0.00%), and an "if you hold to Polymarket resolution" callout with YES and NO terminal payouts.
+5. First trade per wallet → blocking disclosure modal (§5.6).
+6. Signs. Tx flows through `TradeCpi` (tag 10) → `percolator-match` matcher → engine updates position.
+
+### 5.4 Settlement & claim
+
+**Notifications (user opts in at first trade):**
+
+- In-app banner on `/portfolio` once the underlying Polymarket market enters `RESOLVING`. Clears on claim click.
+- Email if user added one in `/settings`: one on `RESOLVING`, one on `SETTLED`.
+- Optional Discord webhook.
+
+**Claim flow:** after the underlying Polymarket market finalizes and our `TerminalSnap` lands (or after `EmergencyUnwind` settles), the position panel becomes a single `Claim $X` button. One tx → existing `ForceCloseResolved` (tag 30). If the user never claims, after 30 days admin can call `AdminForceCloseAccount` and funds sweep to the user's wallet automatically.
+
+### 5.5 Market lifecycle states (UI)
+
+Five user-visible states:
+
+- `LIVE` — normal trading.
+- `HALTED` — last 4 hours before underlying Polymarket trading closes; close-only, no new positions. Banner: *"Trading halts in 47:02. Polymarket trading closes 47:02 after that. Settlement once Polymarket resolves."*
+- `SETTLING` — Polymarket has reported a finalized outcome but our settlement crank hasn't fired yet. Existing positions auto-snap on `TerminalSnap` call. Banner: *"Polymarket resolved YES. Your position will close at $1.00."*
+- `SETTLED` — terminal. `Claim $X` buttons.
+- `FORCE_UNWIND` — emergency path with a sub-reason (oracle stale / Polymarket delisted / underlying paused). Red banner: *"This perp was unwound at last good price ($0.420). [Read the postmortem]"*
+
+### 5.6 First-trade disclosure modal
+
+A blocking modal on the first perp trade for any wallet (tracked client-side + server-side flag), required checkbox:
+
+> **You're trading a leveraged perp on a market that lives somewhere else.**
+>
+> - The underlying question is on **Polymarket**, on a different blockchain (Polygon).
+> - Polymarket — **not us** — decides whether YES or NO wins.
+> - You can be **liquidated** before Polymarket resolves and lose your margin.
+> - If Polymarket goes down, gets sanctioned, or the market is relisted under new rules, **your position is force-closed at the last good oracle price**. You may take a loss you did not choose.
+> - If you hold to Polymarket's resolution, your position snaps to **$0 or $1** against your entry.
 >
 > [ ] I understand   `[Continue]`
 
-Checkbox required to enable `Continue`. Dismiss is one-time per wallet — never re-shown. This is the highest-risk error mode on the product (confusing perp with spot) and gets the only blocking modal in the whole flow.
+Dismiss is one-time per wallet. This is the highest-risk error mode on the product (a user confusing our perp with Polymarket spot) and gets the only blocking modal in the entire flow.
 
-**Liquidation UX.** Sticky in-app banner on `/portfolio`: *"Your 3x long on '<market>' was liquidated at p = 0.31 (entry 0.42). Liquidation fee: $4.20. [View tx]"*. Email + Discord webhook fire only if user opted in (same toggle as spot). Position panel shows the row in red with a `[Postmortem]` link to a per-position page rendering the `p_yes_e6` chart with the liquidation slot marked, accrued funding, and a link to the underlying market's resolution log.
+### 5.7 Creator dashboard
 
-**Terminal settlement UX.** One hour before underlying's `resolution_open_unix`, perp trading halts new positions (per the 4h-window in §15.4, with a 1h "trading halts soon" banner). At resolution, position snaps to 0 or 1 against entry; the position panel collapses to a single `Claim $X` button — **the exact same component as the spot-prediction claim flow.** Same color, same font, same one-tx path through `ForceCloseResolved`. A trader holding both spot YES and 3x perp YES on the same market sees two identical `Claim` buttons stacked. Deliberate — terminal UX is the moment to collapse the product distinction.
+Permissionless creators (V2) get `/creators/<wallet>` showing:
 
-**Visual differentiator.** Spot prediction is teal/blue (calm, deliberation). The perp tab borrows the existing perp red/green trading palette for the chart, ticket, and CTAs, but the prediction hero card stays on top unchanged. A user landing on `/predict/[slab]/perp` should read it as *the leveraged version of the same product*, not a separate product.
+- Lifetime fees earned, active perps count, 24h volume across all perps launched, total open interest.
+- Per-perp row: fee %, 24h volume, 24h fees earned, OI.
+- Bond status: locked SOL + locked seed USDC per perp.
+- Withdraw-earned-fees button (batches across all perps).
 
-### 15.9 New code surfaces
+Per-trader breakdowns are NOT exposed to creators. Creators see aggregate flow only — for trader privacy and to prevent off-platform flow solicitation.
 
-| Surface | Path | Lines | Notes |
-|---|---|---:|---|
-| `market_kind = 2` constant + carve-out in `TradeCpi` | `percolator-prog/src/percolator.rs:7518-7540` | ~30 | Same band floor as `market_kind = 1` |
-| Oracle adapter (`read_underlying_p_yes_twap_e6`) | `percolator-prog/src/percolator.rs` (new) | ~150 | Ring buffer + clamp + depth + staleness checks |
-| `LinkUnderlying` instruction (tag **40**) | `percolator-prog/src/percolator.rs` | ~80 | Binds `config.underlying_slab` once at perp init; admin-only in V3, permissionless in V3.1 with bond |
-| `MarketConfig` tail extension (no V-bump) | `MarketConfig` (§2.2) | ~40 | `underlying_slab: [u8; 32]`, `perp_locks_with_underlying: bool`, 150-slot TWAP ring |
-| Lifecycle hook | `percolator-keeper/src/services/predictionSettle.ts` | ~120 | Fan-out from underlying resolution to dependent perps |
-| Engine | — | **0** | 5x cap is just margin params; refund path already exists from §2.6 |
-| Frontend perp panel | `app/components/predict/PerpOnPredPanel.tsx` | ~350 | Leverage chips capped at 5x, underlying-chart embed, liq-distance indicator |
-| Frontend hook | `app/hooks/usePerpOnPrediction.ts` | ~120 | Wraps `useVAMM` + `usePredictionMarket(underlying)` |
-| SDK | `@percolatorct/sdk` 3.1 | ~80 | `instructions.linkUnderlying`, `parseMarketConfigV13_K2` |
-| Indexer | `PerpOnPredIndexer.ts` | ~100 | New table tracking perp ↔ underlying linkage |
+---
 
-**Total: ~1,070 lines net new.** Estimate: **4-5 weeks senior eng + 2 weeks frontend + 1 week audit overlap.** Compare to the V1 build (~1,300 lines, 16-18 weeks): V3 is dramatically cheaper because it is *purely* a configuration variant; the matcher binary and engine method work from V1 do the heavy lifting.
+## Section 6 — Fee economics & creator incentives
 
-### 15.10 Risks specific to this product
+### 6.1 Fee model
 
-| Risk | Mitigation |
+Trader pays `config.trading_fee_bps` (default 50 = 0.50%) at trade time. Split:
+
+| Recipient | V1 default | V2 default | Hard min | Hard max |
+|---|---|---|---|---|
+| Protocol treasury | 70% | varies | 22% | 70% |
+| Market creator | 0% (= treasury) | 0-8% (creator-set) | 0% | 8% |
+| LP | 30% | varies | 30% | 60% |
+
+The V2 split is creator-set within bounds. A creator who picks the maximum 8% leaves 92% to be split protocol/LP per the hard-min rules. LP minimum 30% protects depth providers.
+
+### 6.2 V2 launcher bond
+
+10 SOL at launch into a `LauncherBond` PDA. Plus a creator-defined `market_seed_deposit` in USDC for the initial LP buffer.
+
+| Scenario | Bond outcome |
 |---|---|
-| Underlying thin liquidity → oracle manipulation | Min `b_e6 ≥ 5k USDC` at `LinkUnderlying` time, 150-slot TWAP, circuit breaker on >20% TWAP delta in 10 slots auto-halts perp trading |
-| Terminal-snap creates instant winners/losers at resolution | Pre-resolution halt window: perp trading closes 4h before underlying's `resolution_open_unix` (§15.4) — wider than underlying's 60-min lock because perp positions are leveraged |
-| INVALID cascade (underlying refunds → perp must refund) | `resolve_market_refund_not_atomic` (§2.6) called via lifecycle hook. The refund-detach helper handles trade-fee retention; no new engine code |
-| User confuses perp with spot (highest-impact error) | First-trade blocking modal with required checkbox (§15.8); chip-based leverage selector that defaults to 2x; identical terminal-claim UX so the products collapse at settlement |
-| Self-referential funding spiral | N/A — funding hard-coded to zero (§15.2) |
-| Underlying matcher fee gaming via perp positioning | Out of scope for V3; flag for V3.1 monitoring with cross-market position limits if it materializes |
+| Clean resolution (Polymarket-YES, Polymarket-NO, or Polymarket-INVALID), no protocol-side incident | Full refund 90d after underlying resolution |
+| Sudden launch-then-bail (creator withdraws all fees within 7d of launch + market sees no further volume) | 50% slash to insurance |
+| Bound to manipulable underlying (post-launch detection of Polymarket market with <$25k liquidity at link time, falsified) | 100% slash to insurance |
+| Underlying delisted by Polymarket (no fault of creator) | Full refund 30d after force-unwind |
 
-### 15.11 Out of scope for V3
+**Fee-claim cap during the bond-lock window:** 25% of accrued fees claimable in the first 30 days, regardless of volume. Remainder unlocked progressively. This deters pump-then-bail without making honest creator economics infeasible.
 
-Multi-outcome underlyings (perps on `market_kind = ?` when we ship `PredictionMulti`), cross-product netting between underlying spot and perp positions, SOL-denominated probability perps, and dynamic leverage tiers (e.g., 3x default with a wallet-history-gated 5x unlock). All revisit-able once V3 ships a clean lifecycle on a binary underlying.
+### 6.3 Spam protection beyond the bond
+
+- **Per-wallet rate limit:** 1 perp per 24 hours.
+- **Curated oracle-source allowlist** even in V2. Pyth and Switchboard public; custom keepers require a separate per-creator approval flow until V2.1.
+- **Minimum collateral mint allowlist** — USDC + a handful of approved stablecoins only.
+
+---
+
+## Section 7 — Off-chain / backend changes
+
+### 7.1 Keeper services (`dcccrypto/percolator-keeper`)
+
+The keeper is the new oracle TCB under the pivot. Five new services:
+
+- **`polymarketPoller.ts`** — polls Polymarket's REST API every 5 seconds for each linked market. Maintains in-memory state.
+- **`pythMonitor.ts`** — subscribes to Pyth feeds for Pyth-sourced markets. Computes implied probability from price-threshold-time-decay function for those markets.
+- **`oraclePusher.ts`** — wraps poller output in a Squads multisig tx and submits `PushOracleSnapshot`. 2-of-3 signature scheme; one external co-signer; monthly key rotation. HSM-backed where feasible.
+- **`terminalSnapCranker.ts`** — on observing a Polymarket market resolve (via the poller), submits `TerminalSnap` to fire settlement.
+- **`emergencyUnwindCranker.ts`** — fires `EmergencyUnwind` when staleness or deviation thresholds breach for >15 minutes.
+
+The existing crank loop (`crank.ts`) requires no changes — `KeeperCrank` (tag 5) itself is unchanged for perp-on-Polymarket markets.
+
+### 7.2 Indexer services (`dcccrypto/percolator-indexer`)
+
+Two new pieces:
+
+- **`polymarketLinkage.ts`** — subscribes to `LinkPolymarketMarket` events and maintains a Supabase table `polymarket_market_links` mapping condition-id ↔ slab pubkey ↔ launcher wallet.
+- **Second-source REST poller** (independent of the keeper). Polls Polymarket REST every 30 seconds; writes the latest probability to a `polymarket_second_source` PDA on Solana via an indexer-controlled signer. The wrapper's `PushOracleSnapshot` reads this PDA and rejects keeper submissions deviating by >300 bps. **Critical safety component** — without this, a compromised keeper can manipulate the oracle freely.
+- **`oracle_health_view`** materialized view: per-perp staleness, deviation, last-update-slot. Powers the trade-page oracle-health pill and the keeper-team's monitoring dashboards. Sentry P0 alerts fire on staleness > 30s; PagerDuty pages on deviation > 200 bps.
+
+The previously planned `resolver_rate_view` (for native-prediction-market resolver-rate auto-rotation) is dropped under the pivot.
+
+### 7.3 API routes (`dcccrypto/percolator-launch`)
+
+New routes:
+
+- `GET /api/predict/markets` — discoverable markets (Polymarket-active + linked).
+- `GET /api/predict/markets/[slab]` — slab detail, oracle health, Polymarket attribution.
+- `GET /api/predict/markets/[slab]/oracle-health` — staleness, deviation, last 20 ring-buffer entries.
+- `GET /api/creators/[wallet]` — creator dashboard data.
+- `POST /api/predict/launch` (V2) — wizard submission; constructs the `LinkPolymarketMarket` tx for client-side signing.
+
+### 7.4 Frontend (`dcccrypto/percolator-launch`)
+
+New route subtree:
+
+- `app/predict/page.tsx` — discovery / market list.
+- `app/predict/[slab]/page.tsx` — trade page.
+- `app/creators/[wallet]/page.tsx` — creator dashboard.
+
+New components in `app/components/predict/`:
+
+- `PerpOnPredPanel.tsx` (trade ticket)
+- `PredDisclosureModal.tsx` (first-trade modal)
+- `OracleHealthPill.tsx` (top-right of trade page)
+- `EmergencyUnwindBanner.tsx`
+- `PolymarketAttributionFooter.tsx`
+- `CreatorResolutionCard.tsx`
+
+Extends existing components: `app/components/trade/PriceChart.tsx` (0-1 y-axis when `market_kind == 2`), `app/components/oracle/OracleFreshnessIndicator.tsx` (Polymarket-specific staleness thresholds).
+
+The existing `TradeCpi`-based wallet code does not need to know about Polymarket specifically — same instruction, different oracle.
+
+---
+
+## Section 8 — Reuse vs. new
+
+| Component | Reused as-is | Reused with changes | New |
+|---|:-:|:-:|:-:|
+| `dcccrypto/percolator` engine | ✓ (refund-mode method already shipped; covers Polymarket-INVALID + emergency-unwind) | | |
+| `dcccrypto/percolator-prog` wrapper — `TradeCpi`, `KeeperCrank`, `ResolveMarket`, `ForceCloseResolved` | ✓ | | |
+| `dcccrypto/percolator-prog` wrapper — `MarketConfig` layout | | ✓ (V13 layout shipped; new fields appended in follow-up) | |
+| `dcccrypto/percolator-prog` wrapper — new oracle adapter + 5 new instruction tags | | | ✓ |
+| `dcccrypto/percolator-match` (active oracle-anchored spread quoter) | ✓ (with one-time bounded-domain conformance audit) | | |
+| `dcccrypto/percolator-stake` (insurance LP staking) | ✓ | ✓ (junior tranche cooldown extends to cover halt + 24h buffer) | |
+| `dcccrypto/percolator-keeper` keeper loop | ✓ | | ✓ (5 new services per §7.1) |
+| `dcccrypto/percolator-indexer` core | ✓ | | ✓ (second-source poller + oracle-health view) |
+| `dcccrypto/percolator-launch` frontend + backend services | ✓ | ✓ (extend trade page, oracle indicator) | ✓ (new `predict/`, `creators/`, disclosure modal, etc.) |
+| SDK (`@percolatorct/sdk`) | | ✓ (semver major bump for new instruction builders) | |
+
+The reused column dominates. This is the architectural property that makes the pivot cheap to ship.
+
+---
+
+## Section 9 — Migration & backwards compatibility
+
+### 9.1 Discriminating perp-on-Polymarket vs. legacy perp
+
+`config.market_kind: u8`. Legacy perp slabs have zero-filled reserved bytes; `market_kind == 0` reads as Perp and matches existing behavior. **No migration needed for live perp markets.**
+
+### 9.2 V13 layout already-shipped fields
+
+The earlier `feat/prediction-markets` wrapper commit introduced the V13 layout with several fields tuned for native prediction markets (`resolution_outcome_pending`, `ratification_deadline_unix`, `dispute_window_slots`, `resolution_open_unix`, `resolution_deadline_unix`). Under the pivot these fields are deprecated-but-retained — leaving them in place is simpler than reverting the layout commit, and a future native-prediction product could reuse them. The new perp-on-Polymarket fields append to the V13 tail; legacy zero-filled reads continue to work.
+
+### 9.3 SDK versioning
+
+The new instruction tags (40-44) and the `MarketConfig` field additions require an SDK major bump. Ship 3.0.0 with new instruction builders and updated `parseMarketConfig` covering both the legacy-perp and perp-on-Polymarket field reads.
+
+---
+
+## Section 10 — Risks & testing
+
+### 10.1 Risks the existing engine does not catch
+
+1. **Polymarket relisting / freeze / takedown (CRITICAL).** Polymarket can delist, freeze trading, change ticker mapping, or be sanctioned mid-life. Our perp would have an open OI book and a now-dead oracle. **Mitigation:** treat a Polymarket relist/freeze as `OraclePaused` → mandatory unwind at last valid TWAP minus a 200 bps conservativeness haircut routed to insurance; do not settle at zero; do not keep trading.
+
+2. **UMA dispute → outcome flip mid-life (HIGH).** Polymarket resolves YES (or NO); our `TerminalSnap` fires; UMA voters flip the outcome in the 48h escalation window. We have already paid winners. **Mitigation:** never `TerminalSnap` on the first Polymarket resolution proposal. Wait the full UMA challenge period (2h optimistic + 48h escalation if disputed) plus a 24h buffer before settling. Inherit Polymarket's lifecycle states explicitly: `LIVE → PROPOSED → CHALLENGED? → FINALIZED`. Halt new opens at `PROPOSED`, terminal-snap only at `FINALIZED`.
+
+3. **Pyth feed manipulation on the underlying spot (HIGH).** For Pyth-sourced markets, attacker manipulates Pyth confidence interval to liquidate the opposite side of our book. **Mitigation:** Pyth confidence-interval guard (`conf / price < 100 bps`); minimum publisher count (≥5); EMA price not aggregate price; 60-slot TWAP on our side over Pyth's own price; reject trades when `|spot − Pyth EMA| > 200 bps`.
+
+4. **Cross-chain bridge trust (HIGH, if applicable).** If we ever use a bridge for any market, the bridge becomes part of our oracle TCB. **Mitigation:** treat any bridge as a single-source oracle with the same staleness/deviation guards as a custom keeper. For markets with OI > $100k, require two-source agreement. Wormhole / LayerZero / Switchboard cross-chain are all single-source under this rule.
+
+5. **Custom-keeper compromise (HIGH).** Long-tail markets without Pyth coverage rely on a keeper signer. Key compromise → write `p = 0.99` → harvest liquidations of shorts → write back. **Mitigation:** keeper signer is 2-of-3 Squads multisig with one external co-signer; on-chain per-slot move clip (`max_price_move_bps_per_slot = 500`); second-source deviation circuit-breaker; canary trades; HSM-backed signing where feasible.
+
+6. **Permissionless launcher binds to a manipulable underlying (CRITICAL).** Anyone launches a perp on a Polymarket market with $2k of liquidity. Pre-positions, then moves the underlying with a $10k spot trade, liquidates every counterparty. **Mitigation:** wrapper-side gates at `LinkPolymarketMarket` time (§5.2); 6-hour cooling pool; bond-claim cap.
+
+7. **8% creator-fee pump-then-bail (HIGH).** Creator inflates volume with wash trades, claims fees, then liquidates LPs. **Mitigation:** §6.2 fee-claim cap (25% of accrued in first 30 days); bond unlocked only 90 days after market resolution; canary-wash-trading detection in the indexer.
+
+8. **Polymarket spot vs. our perp basis blowout (MEDIUM).** Funding is zero (§4.1). No economic force closes the perp-vs-spot basis. **Mitigation:** matcher spread widens hyperbolically as `|perp_mark − underlying_p| / underlying_p` exceeds 500 bps. The existing oracle-anchored spread quoter supports this via its impact-term coefficient.
+
+### 10.2 Testing strategy
+
+1. **Kani proofs.** The refund-mode harness suite already shipped on `feat/prediction-markets` (empty market, single-account-no-position, single-account-with-position, two-account-bilateral, preservation, four precondition rejections, end-to-end refund-then-close) covers the engine-side correctness of Polymarket-INVALID inheritance and emergency-unwind. New harnesses for the oracle adapter (`PushOracleSnapshot` monotonicity, deviation guard, second-source check) land alongside the wrapper-side commits.
+
+2. **`percolator-match` conformance audit.** One-time external audit before V1 launch verifying the matcher's behavior under the bounded `[0, 1]` probability domain — specifically: price-type domain-agnosticism, quoter clamp behavior at boundaries, tick-size compatibility. ~3 days of one senior auditor, ~$10-15k. **Pre-mainnet, hard prerequisite.**
+
+3. **Devnet trial.** 3-week minimum with mock-Polymarket fixtures (a stub program that mimics Polymarket CTF state on devnet). Lifecycle tests: clean YES/NO resolution, UMA-flip mid-life, oracle staleness, Polymarket-delisted, custom-keeper-compromised. Bridge failures need explicit coverage if a bridge is used for any market.
+
+4. **Simulation harness.** Initialize a perp, generate 1000 random trades on a symbolic probability walk, fire `TerminalSnap` at terminal `p`, walk every position close, verify sum-of-payouts identity. CI-gated.
+
+5. **External audit.** ~3-4 weeks single senior auditor (Halborn or OtterSec). Cost: $40-60k. Pre-mainnet, hard prerequisite. Scope: wrapper-side oracle adapter + new instruction tags + keeper-key custody + cross-repo trust boundary (keeper-signed PDA → wrapper verification → engine consumption).
+
+---
+
+## Section 11 — Phasing & rollout
+
+### 11.1 V1 launch slate (team-launched)
+
+**Target:** 6-12 markets where Polymarket has corresponding Pyth-driven price thresholds. Don't mirror Polymarket sentiment for V1 — that requires custom keepers we haven't seasoned yet.
+
+Example candidates (subject to Polymarket inventory at launch time):
+
+- "BTC closes above $X on date Y" — multiple price thresholds, multiple dates.
+- "ETH closes above $X on date Y" — same.
+- "SOL closes above $X on date Y" — our ecosystem flagship.
+
+For each market, Pyth is the oracle; the implied probability is computed by the keeper as a time-decay-toward-threshold function and pushed via `PushOracleSnapshot`. Custom-keeper risk is constrained to a single mechanical computation that's easy to second-source.
+
+### 11.2 V1 minimum-viable feature set
+
+**Must-ship:**
+
+- `/discover` with Polymarket-aware market list.
+- `/predict/[slab]/page.tsx` trade page with oracle-health pill, liquidation-line chart overlay, "if you hold to resolution" callout.
+- First-trade disclosure modal (blocking).
+- Polymarket attribution component (sitewide).
+- Settlement notifications (in-app banner + email).
+- Public oracle-health page linked from every trade-page pill.
+- `EmergencyUnwind` cranker fully wired.
+
+**Defer to V1.1:**
+
+- Custom-keeper-sourced markets (sentiment markets without Pyth coverage).
+- Devnet play-money mode.
+- Switchboard On-Demand integration.
+
+**Defer to V2:**
+
+- Permissionless `LinkPolymarketMarket`.
+- Creator dashboard.
+- 8% creator-fee mechanics.
+- Cooling-pool + reporting flow.
+
+### 11.3 V2 gate criteria
+
+Flip to permissionless only when all of the following hold for ≥ 30 consecutive days:
+
+- ≥ 10 V1 markets resolved cleanly (no protocol-side incident).
+- ≥ $500k cumulative perp volume.
+- ≥ 200 unique trader wallets.
+- Insurance fund senior tranche ≥ $250k.
+- Zero unresolved Sentry P0/P1 errors in the predict path for 14 days.
+- Postmortem cadence holding (every emergency-unwind gets a published postmortem within 7d).
+
+Publish a public `/predict/readiness` dashboard tracking each metric.
+
+### 11.4 Operational responsibilities
+
+| Role | Owner | SLA |
+|---|---|---|
+| V1 launch queue review | PM rotation, weekly | 24h |
+| Oracle keeper key rotation | Keeper team | Monthly |
+| Emergency-unwind first response | On-call eng + PM | Ack within 30 min |
+| Postmortem authorship | PM on the incident | Published within 7d |
+| Pyth feed health | Keeper team | Existing on-call rotation |
+
+---
+
+## Section 12 — Open questions for team alignment
+
+1. **Geofencing.** Polymarket is US-geofenced; we are globally accessible from Solana. Counsel input required before V1 launch.
+2. **Council seats.** The `EmergencyRelink` (tag 44) Council is 3-of-5 multisig. Two external members need naming + commitment. Suggest reaching out to Solana Foundation and a prediction-market-native ex-Polymarket / ex-Augur engineer.
+3. **Insurance fund segregation.** Should the perp-on-Polymarket insurance tranche be separate from perp insurance, or shared? Recommend separate tranche, shared LP UI.
+4. **Polymarket-relisting handling.** If Polymarket re-IDs a market mid-perp-life (rare but documented), what's the protocol response? Default: `EmergencyUnwind` at last-good TWAP. Consider whether Council can `EmergencyRelink` to the new condition-id with a 48h cooldown.
+5. **Cross-market correlation warnings.** A trader holding $5k on four correlated Polymarket markets (e.g., four candidates in the same election) is concentrated. Surface portfolio-level correlation warnings? V1.2 flag.
+6. **Polymarket attribution requirements.** Does Polymarket have terms requiring or prohibiting our use of their condition-ids and market metadata? Counsel + product check.
+7. **Mobile order-ticket density.** Single trade page, single ticket. Mobile is the primary form factor for retail perp traders. Dedicated mobile-design pass before V1.
+8. **OG image rendering.** Dynamic OG cards on Vercel add latency/cost. Pre-generate at launch time and CDN-cache.
+
+---
+
+## Section 13 — Estimated effort & timeline
+
+| Workstream | Effort | Notes |
+|---|---|---|
+| `percolator-prog` wrapper: V13 field additions + oracle adapter + 5 new instruction tags | 3-4 weeks senior eng | Includes Kani proof updates for the new instructions |
+| `percolator-match` bounded-domain conformance audit | 3 days senior auditor | Pre-mainnet hard prerequisite (~$10-15k) |
+| `percolator-keeper` services (poller, Pyth monitor, oracle pusher, terminal-snap cranker, emergency-unwind cranker) | 3 weeks TS eng | Keeper-multisig setup is the long pole |
+| `percolator-indexer` services (linkage tracker, second-source poller, oracle-health view) | 1.5 weeks TS eng | Supabase schema + on-call alerting |
+| `percolator-stake` cooldown extension | 0.5 weeks Rust + TS | Constant change + UI countdown coordination |
+| `percolator-launch` API routes | 1 week | Next.js handlers |
+| `percolator-launch` frontend (`predict/*`, `creators/*`, components, hooks) | 4 weeks | Bulk of UX work |
+| SDK 3.0 release | 1 week | New instruction builders + V13 parsers |
+| Third-party external audit | 3-4 weeks single senior auditor | Pre-mainnet hard prerequisite (~$40-60k) |
+| Devnet trial | 3 weeks | Hard gate before mainnet |
+
+**Total: ~10-12 weeks from kickoff to V1 mainnet**, assuming one senior eng on wrapper + keeper, one frontend eng, one PM. **V2 permissionless adds ~3-4 weeks** for the `LinkPolymarketMarket` permissionless gate, the launcher-bond economics, the cooling pool, and the creator dashboard.
 
 ---
 
@@ -1141,20 +706,19 @@ Multi-outcome underlyings (perps on `market_kind = ?` when we ship `PredictionMu
 
 All paths verified during this design pass:
 
-- `dcccrypto/percolator-prog/src/percolator.rs` — BPF wrapper, tag dispatch (`:1935-2249`), `ResolveMarket` handler (`:8479-8559`), `ForceCloseResolved` handler (`:9384-9466`), `TradeCpi` band check (`:7518-7540`), `MarketConfig` (`:2524-2685`).
-- `dcccrypto/percolator/src/percolator.rs` — no_std risk engine, `InsuranceFund` (`:210`), ADL state (`:265-277`).
-- `dcccrypto/percolator-matcher/src/lib.rs` — matcher CPI ABI (`MatcherCall`/`MatcherReturn` at `:144-184`).
-- `dcccrypto/percolator-matcher/src/vamm.rs` — `MatcherCtx` (`:81-125`); reference for LMSR matcher's tail layout.
-- `dcccrypto/percolator-stake/src/state.rs` — senior/junior tranche fields, junior-loss accounting.
-- `dcccrypto/percolator-keeper/src/services/` — keeper structure for new prediction services.
-- `dcccrypto/percolator-indexer/src/services/` — indexer structure for new prediction tables.
-- `percolator-launch/app/app/api/` — existing API surface where prediction routes attach.
+- `dcccrypto/percolator/src/percolator.rs` — `no_std` risk engine. `resolve_market_refund_not_atomic` and the refund-mode Kani harness suite already shipped on `feat/prediction-markets`.
+- `dcccrypto/percolator-prog/src/percolator.rs` — BPF wrapper. V13 `MarketConfig` layout already shipped on `feat/prediction-markets`. Tag dispatch, `TradeCpi` band check, `ResolveMarket` handler, `ForceCloseResolved` handler all reused unchanged.
+- `dcccrypto/percolator-match` — active oracle-anchored spread quoter matcher. Reused with one-time bounded-domain conformance audit.
+- `dcccrypto/percolator-stake/src/state.rs` — senior/junior tranche fields, junior-loss accounting. Cooldown extension is a single constant change.
+- `dcccrypto/percolator-keeper/src/services/` — keeper service structure. New services land alongside existing crank loop.
+- `dcccrypto/percolator-indexer/src/services/` — indexer service structure. New polymarket-linkage and oracle-health pieces land alongside existing trade indexer.
+- `dcccrypto/percolator-launch/app/` — existing Next.js + backend services. New `predict/` and `creators/` route subtrees attach here.
 
 ## Appendix B — Hand-off notes
 
-- **PM-UX → Engineering:** align resolution timing copy (`resolution_open_unix`, `resolution_deadline_unix`, `dispute_window_slots`) with on-chain field semantics. Wizard's resolution-date inputs must map exactly to slot-budgeted on-chain values.
-- **Engineering → Marketing:** the "no sub-brand" decision needs marketing sign-off. If they want a sub-brand, the IA discussion (Section 6.5) reopens.
-- **All → Counsel:** geofencing decision (Section 13.1) is the highest-priority external dependency. Block V1 launch on counsel sign-off.
+- **PM-UX → Engineering:** Polymarket lifecycle timing (UMA propose → challenge → finalize windows) must match the wrapper's `TerminalSnap` gating. Wizard date displays must align with on-chain timestamps.
+- **Engineering → Marketing:** Polymarket attribution wording and logomark usage need brand sign-off before V1 launch.
+- **Engineering → Counsel:** the §12.1 geofencing question and the §12.6 Polymarket-attribution question are the two highest-priority external dependencies. Block V1 launch on counsel sign-off for both.
 
 ---
 
