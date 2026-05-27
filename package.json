@@ -2,7 +2,7 @@
   "name": "@percolatorct/prediction-workspace",
   "version": "0.0.1",
   "private": true,
-  "description": "Workspace root for Percolator prediction markets — match-pred matcher (rust), sdk-pred SDK staging (ts), and integration tests (ts)",
+  "description": "Workspace root for Percolator prediction-markets product — sdk-pred SDK staging (ts) and integration tests (ts). Design proposal + README live alongside.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

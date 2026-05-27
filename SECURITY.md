@@ -33,7 +33,6 @@ Please **do not** open public GitHub issues for security-sensitive findings unti
 
 In scope for security reports against this repository:
 
-- The Rust matcher binary in `match-pred/` (math invariants, panic safety, fixed-point arithmetic correctness, CPI ABI conformance once implemented).
 - The TypeScript SDK in `sdk-pred/` (instruction builders, the V13 `MarketConfig` parser, slippage helpers — once implemented).
 - The integration test harness in `tests/` (test scripts that handle real keypairs or post fund-touching transactions).
 - The CI workflows under `.github/workflows/` (anything that could exfiltrate secrets or alter build outputs).
@@ -47,9 +46,9 @@ Out of scope for this repository, but in scope for the linked upstream repos:
 
 The prediction-markets feature ships with a single coordinated audit covering:
 
-- The matcher binary (`match-pred/`) in this repo.
 - The wrapper changes on the `feat/prediction-markets` branch of `dcccrypto/percolator-prog`.
 - The engine method on the `feat/prediction-markets` branch of `dcccrypto/percolator`.
+- The off-chain oracle and settlement services on the corresponding `feat/prediction-markets` branches of `dcccrypto/percolator-keeper` and `dcccrypto/percolator-indexer`.
 
 The audit report and the SDK / keeper / indexer code coverage will be published when the corresponding programs are deployed to mainnet.
 

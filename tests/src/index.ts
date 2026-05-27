@@ -12,10 +12,10 @@
  *     verify sum-of-payouts identity (Sum(payout_i) <= Sum(collateral_i)
  *     + b * ln(2))
  *
- * Rust property tests live inside the `match-pred` crate as `#[cfg(test)]`
- * modules — they exercise the LMSR math invariants and run as part of
- * `cargo test`. The integration harness here is purely off-chain
- * orchestration.
+ * The integration harness here is purely off-chain orchestration.
+ * Engine-level property tests live upstream in the `percolator` crate
+ * (Kani harnesses + `#[cfg(test)]` modules); wrapper-level fixture tests
+ * live in `percolator-prog`.
  *
  * The current commit is a placeholder so `tsc --noEmit` runs cleanly
  * against the workspace. Subsequent commits add the scenario scripts.

@@ -1,6 +1,6 @@
 # tests/ — Integration test harness
 
-End-to-end devnet-targeted scripts that exercise full prediction-market lifecycles. **Not** unit tests — those live alongside the code they test (Rust `#[cfg(test)]` modules in `match-pred/`, vitest in `sdk-pred/`, frontend tests in the upstream `percolator-launch` feature branch).
+End-to-end devnet-targeted scripts that exercise full prediction-market lifecycles. **Not** unit tests — those live alongside the code they test (vitest in `sdk-pred/`, on-chain Kani harnesses and `#[cfg(test)]` modules in the upstream `percolator` + `percolator-prog` feature branches, frontend tests in the upstream `percolator-launch` feature branch).
 
 ## Scope
 
